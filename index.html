@@ -1,251 +1,342 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Qwen Air Pro</title>
-    <script type="importmap"> { "imports": { "@mlc-ai/web-llm": "https://esm.run/@mlc-ai/web-llm" } } </script>
-    <style>
-        :root { --apple-blue: #007AFF; --apple-red: #FF3B30; --glass: rgba(255, 255, 255, 0.7); }
-        html, body { height: 100%; margin: 0; padding: 0; -webkit-font-smoothing:antialiased; font-family: -apple-system, system-ui, sans-serif; }
-        /* Safe-area awareness for iPhone notch/statusbar */
-        .app-card { width: 95%; max-width: 450px; height: 92vh; background: var(--glass); backdrop-filter: blur(25px); -webkit-backdrop-filter: blur(25px); border: 1px solid rgba(255,255,255,0.4); border-radius: 20px; margin: auto; display:flex; flex-direction:column; padding-top: env(safe-area-inset-top); padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box; margin-top: 4vh; }
-        body { margin: 0; padding: 0; height: 100vh; background: linear-gradient(160deg, #a2c2e6 0%, #d4e1f5 100%); display: flex; justify-content: center; align-items: flex-start; }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Qwen Air Pro</title>
 
-        /* Download Progress Overlay */
-        #download-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.95); z-index: 100; display: none; flex-direction: column; justify-content: center; align-items: center; gap: 12px; border-radius: 20px; }
-        .progress-container { width: 80%; height: 6px; background: #e5e5ea; border-radius: 3px; overflow: hidden; margin: 20px 0; }
-        #progress-bar { width: 0%; height: 100%; background: var(--apple-blue); transition: width 0.12s linear; }
+  <!-- Import map for web-llm -->
+  <script type="importmap">
+    { "imports": { "@mlc-ai/web-llm": "https://esm.run/@mlc-ai/web-llm" } }
+  </script>
 
-        header { padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 0.5px solid rgba(0,0,0,0.1); background: rgba(255,255,255,0.2); border-top-left-radius: 20px; border-top-right-radius: 20px; }
-        h1 { margin: 0; font-size: 16px; font-weight: 600; color: #1d1d1f; }
+  <style>
+    /* Slim, essential styles only (safe-area-aware) */
+    :root { --primary:#007AFF; --danger:#FF3B30; --bg:#f6f8fb; --card:#ffffff; --muted:#8e8e93; --glass: rgba(255,255,255,0.85); }
+    html,body{height:100%;margin:0;font-family: -apple-system, system-ui, sans-serif;background:linear-gradient(160deg,#a2c2e6,#d4e1f5);-webkit-font-smoothing:antialiased}
+    .card{box-sizing:border-box;width:95%;max-width:460px;margin:4vh auto;height:92vh;background:var(--glass);border-radius:16px;padding-top:env(safe-area-inset-top);display:flex;flex-direction:column;overflow:hidden}
+    header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:transparent}
+    .title{font-weight:600;font-size:16px;color:#111}
+    .controls{display:flex;gap:8px;align-items:center}
+    .btn{background:transparent;border:1px solid rgba(0,0,0,0.06);padding:6px 10px;border-radius:12px;font-size:13px;cursor:pointer}
+    .btn--danger{color:var(--danger);border-color:rgba(255,59,48,0.12)}
+    .toggle{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+    #chat{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;background:transparent}
+    .msg{max-width:80%;padding:10px 12px;border-radius:14px;word-break:break-word;font-size:15px;box-shadow:0 1px 0 rgba(0,0,0,0.02)}
+    .user{align-self:flex-end;background:var(--primary);color:white;border-bottom-right-radius:4px}
+    .assistant{align-self:flex-start;background:#fff;color:#111;border-bottom-left-radius:4px}
+    .input-row{display:flex;padding:10px;gap:8px;border-top:1px solid rgba(0,0,0,0.04);background:rgba(255,255,255,0.6)}
+    input[type="text"]{flex:1;padding:10px 12px;border-radius:18px;border:1px solid #e6e6e6;font-size:15px}
+    button#send{background:var(--primary);color:white;border:none;padding:8px 12px;border-radius:12px;cursor:pointer}
+    button:disabled{opacity:0.5;cursor:not-allowed}
 
-        /* Reset Button Style */
-        .reset-btn { font-size: 13px; font-weight: 500; color: var(--apple-red); background: rgba(255, 59, 48, 0.1); border: none; padding: 6px 12px; border-radius: 15px; cursor: pointer; transition: all 120ms ease; }
-        .reset-btn:active { background: rgba(255, 59, 48, 0.2); transform: scale(0.95); }
+    /* Overlay used during init + modal for traits edit */
+    .overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(255,255,255,0.85);z-index:60;padding:20px}
+    .progress{width:80%;height:6px;background:#eee;border-radius:6px;overflow:hidden}
+    .bar{height:100%;width:0%;background:var(--primary);transition:width 120ms linear}
 
-        #chat-box { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; scroll-behavior: smooth; }
-        .msg { max-width: 80%; padding: 12px 16px; border-radius: 20px; font-size: 15px; line-height: 1.4; animation: spring 0.4s ease-out; word-wrap: break-word; box-sizing: border-box; }
-        .user { align-self: flex-end; background: var(--apple-blue); color: white; border-bottom-right-radius: 4px; }
-        .ai { align-self: flex-start; background: white; color: #1d1d1f; border-bottom-left-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+    .modal{width:92%;max-width:420px;background:var(--card);border-radius:12px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,0.12)}
+    .modal h3{margin:0 0 8px 0;font-size:15px}
+    .traits{display:flex;flex-direction:column;gap:8px;max-height:48vh;overflow:auto;padding-right:6px}
+    .trait-row{display:flex;gap:8px;align-items:center}
+    .trait-row input{flex:1;padding:8px;border-radius:8px;border:1px solid #eee;font-size:14px}
+    .small{font-size:12px;color:var(--muted)}
 
-        #thinking { display: none; padding: 10px 20px; }
-        .dots { display: flex; gap: 5px; }
-        .dot { width: 8px; height: 8px; background: #8e8e93; border-radius: 50%; animation: pulse 1.4s infinite; }
-        .dot:nth-child(2) { animation-delay: 0.2s; }
-        .dot:nth-child(3) { animation-delay: 0.4s; }
-
-        .input-bar { padding: 15px; background: rgba(255,255,255,0.6); display: flex; gap: 10px; align-items: center; border-top: 0.5px solid rgba(0,0,0,0.05); border-bottom-left-radius: 20px; border-bottom-right-radius: 20px; }
-        input { flex: 1; border: none; padding: 12px 18px; border-radius: 25px; background: white; outline: none; font-size: 16px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.05); }
-        button#sendBtn { background: var(--apple-blue); color: white; border: none; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; font-weight: 600; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-
-        @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
-        @keyframes spring { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-        /* Small screens: ensure readability on older devices */
-        @media (max-width: 350px) {
-            .app-card { width: 98%; padding: 12px; }
-            #chat-box { padding: 12px; }
-        }
-    </style>
+    /* Minimal responsive adjustments */
+    @media (max-width:360px){ .card{padding:8px} .title{font-size:15px} }
+  </style>
 </head>
 <body>
-
-<div class="app-card" id="appCard">
-    <div id="download-overlay" role="status" aria-hidden="true">
-        <h1>Setting Up</h1>
-        <p id="status-text" style="font-size: 13px; color: #8e8e93;">Optimizing for iPhone 8...</p>
-        <div class="progress-container"><div id="progress-bar"></div></div>
+  <div class="card" id="card">
+    <div class="overlay" id="overlay" role="status" aria-hidden="true">
+      <div class="modal" id="overlayModal" style="text-align:center">
+        <div style="margin-bottom:8px;font-weight:600">Setting Up</div>
+        <div class="small" id="overlayText">Preparing model…</div>
+        <div style="height:12px"></div>
+        <div class="progress"><div class="bar" id="overlayBar"></div></div>
+      </div>
     </div>
 
     <header>
-        <h1>Qwen 2.5 Air</h1>
-        <button class="reset-btn" id="resetBtn">Reset Chat</button>
+      <div class="title">Qwen 2.5 Air (Method 4)</div>
+      <div class="controls">
+        <label class="toggle" title="Low Power Mode">
+          <input type="checkbox" id="lowPowerToggle" />
+          <span class="small">Low Power</span>
+        </label>
+        <button class="btn" id="editTraitsBtn" title="Edit up to 7 user traits">Traits</button>
+        <button class="btn btn--danger" id="resetBtn">Reset</button>
+      </div>
     </header>
 
-    <div id="chat-box" aria-live="polite">
-        <div class="msg ai">Memory cleared. I'm running fresh and cool.</div>
-    </div>
-    
-    <div id="thinking"><div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div></div>
+    <main id="chat" aria-live="polite">
+      <div class="msg assistant">Ready. Stateless worker strategy active.</div>
+    </main>
 
-    <div class="input-bar">
-        <input type="text" id="userInput" placeholder="Ask me anything...">
-        <button id="sendBtn">↑</button>
+    <div class="input-row">
+      <input id="userInput" type="text" placeholder="Ask me anything..." autocomplete="off" />
+      <button id="send">Send</button>
     </div>
-</div>
+  </div>
 
-<script type="module">
+  <!-- Traits modal (hidden by default) -->
+  <div class="overlay" id="modalOverlay" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="traitsTitle">
+      <h3 id="traitsTitle">User Traits (max 7)</h3>
+      <div class="traits" id="traitsList"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+        <button class="btn" id="addTraitBtn">+ Add</button>
+        <button class="btn" id="saveTraitsBtn">Save</button>
+        <button class="btn" id="cancelTraitsBtn">Cancel</button>
+      </div>
+      <div class="small" style="margin-top:8px">When Low Power is ON, only the first 3 traits are injected and history is minimized.</div>
+    </div>
+  </div>
+
+  <script type="module">
     import * as webllm from "@mlc-ai/web-llm";
 
-    // UI refs
-    const chatBox = document.getElementById('chat-box');
-    const thinking = document.getElementById('thinking');
-    const input = document.getElementById('userInput');
-    const sendBtn = document.getElementById('sendBtn');
-    const resetBtn = document.getElementById('resetBtn');
-    const overlay = document.getElementById('download-overlay');
-    const progressBar = document.getElementById('progress-bar');
-    const statusText = document.getElementById('status-text');
-    const appCard = document.getElementById('appCard');
-
-    // Configuration tuned for iPhone 8 / low VRAM
+    // Configuration
     const MODEL_ID = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC";
-    const HISTORY_TURNS = 1;            // keep very small on iPhone 8 (1 user+1 assistant)
-    const MAX_USER_TRAITS = 7;
-    const TRAITS_KEY = 'qwen_user_traits_v1';
+    const MAX_TRAITS = 7;
+    const LOWPOWER_TRAITS_LIMIT = 3; // when low power mode: only inject first 3 traits
+    const DEFAULT_HISTORY_TURNS = 1;  // normal mode: keep 1 turn (user+assistant)
+    const STORAGE_TRAITS = 'qwen_user_traits_v1';
+    const STORAGE_LOWPOWER = 'qwen_lowpower_v1';
+
+    // UI refs
+    const chat = document.getElementById('chat');
+    const input = document.getElementById('userInput');
+    const sendBtn = document.getElementById('send');
+    const resetBtn = document.getElementById('resetBtn');
+    const overlay = document.getElementById('overlay');
+    const overlayText = document.getElementById('overlayText');
+    const overlayBar = document.getElementById('overlayBar');
+    const lowPowerToggle = document.getElementById('lowPowerToggle');
+    const editTraitsBtn = document.getElementById('editTraitsBtn');
+
+    // Modal refs
+    const modalOverlay = document.getElementById('modalOverlay');
+    const traitsList = document.getElementById('traitsList');
+    const addTraitBtn = document.getElementById('addTraitBtn');
+    const saveTraitsBtn = document.getElementById('saveTraitsBtn');
+    const cancelTraitsBtn = document.getElementById('cancelTraitsBtn');
 
     // State
-    let history = []; 
+    let history = []; // external JS history: [{role:'user'|'assistant', content:'...'}]
     let engine = null;
+    let userTraits = [];
+    let lowPower = false;
 
-    // Persistence for user traits (external memory between boots)
+    // Persistence helpers
     function loadTraits() {
-        try {
-            const raw = localStorage.getItem(TRAITS_KEY);
-            if (!raw) return [];
-            const parsed = JSON.parse(raw);
-            if (!Array.isArray(parsed)) return [];
-            return parsed.slice(0, MAX_USER_TRAITS);
-        } catch(e) { return []; }
+      try {
+        const raw = localStorage.getItem(STORAGE_TRAITS);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) return [];
+        return arr.slice(0, MAX_TRAITS);
+      } catch { return []; }
     }
-    function saveTraits(traits) {
-        try {
-            const toSave = Array.isArray(traits) ? traits.slice(0, MAX_USER_TRAITS) : [];
-            localStorage.setItem(TRAITS_KEY, JSON.stringify(toSave));
-        } catch(e) { /* ignore */ }
+    function saveTraits(arr) {
+      try {
+        const toSave = Array.isArray(arr) ? arr.slice(0, MAX_TRAITS) : [];
+        localStorage.setItem(STORAGE_TRAITS, JSON.stringify(toSave));
+      } catch {}
     }
-    function traitsToSystemPrompt(traits) {
-        if (!traits || traits.length === 0) return "You are a light, fast assistant. Keep replies brief.";
-        const list = traits.map((t,i)=>`${i+1}. ${t}`).join("\n");
-        return `You are a light, fast assistant. User profile (max ${MAX_USER_TRAITS} traits):\n${list}\nKeep replies concise and mobile-optimized.`;
+    function loadLowPower() {
+      try { return localStorage.getItem(STORAGE_LOWPOWER) === '1'; } catch { return false; }
+    }
+    function saveLowPower(v) {
+      try { localStorage.setItem(STORAGE_LOWPOWER, v ? '1' : '0'); } catch {}
     }
 
-    // Load user traits (skeleton - no editor UI included; can add later)
-    let userTraits = loadTraits();
-    if (userTraits.length === 0) {
-        // sensible defaults that are small; you can remove this seed behavior
-        userTraits = ['Likes concise answers', 'Prefers numbered steps', 'Timezone: UTC', 'Language: English'];
-        saveTraits(userTraits);
+    // Traits -> system prompt (kept very small)
+    function buildSystemPrompt() {
+      if (lowPower) {
+        // Minimal prompt for lowest VRAM usage
+        // include only a tiny directive + up to LOWPOWER_TRAITS_LIMIT traits (short)
+        const t = userTraits.slice(0, LOWPOWER_TRAITS_LIMIT).map((s,i)=>`${i+1}. ${s}`).join(" | ");
+        return t ? `You are a concise assistant. User: ${t}. Keep replies extremely short.` : `You are a concise assistant. Keep replies extremely short.`;
+      } else {
+        // Normal (still compact) system prompt with up to MAX_TRAITS traits
+        const t = userTraits.slice(0, MAX_TRAITS).map((s,i)=>`${i+1}. ${s}`).join("\n");
+        return t ? `You are a concise assistant optimized for mobile. User traits:\n${t}\nKeep answers short.` : `You are a concise assistant optimized for mobile. Keep answers short.`;
+      }
     }
 
     // UI helpers
     function appendMessage(role, text) {
-        const div = document.createElement('div');
-        div.className = `msg ${role === 'user' ? 'user' : 'ai'}`;
-        div.innerText = text;
-        chatBox.appendChild(div);
-        chatBox.scrollTo({ top: chatBox.scrollHeight, behavior: 'smooth' });
-        return div;
+      const el = document.createElement('div');
+      el.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+      el.textContent = text;
+      chat.appendChild(el);
+      chat.scrollTop = chat.scrollHeight;
+      return el;
     }
 
-    function setOverlay(visible, text = '', progress = undefined) {
-        overlay.style.display = visible ? 'flex' : 'none';
-        overlay.setAttribute('aria-hidden', visible ? 'false' : 'true');
-        if (typeof text === 'string' && text.length) statusText.innerText = text;
-        if (typeof progress === 'number') progressBar.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
+    function setOverlay(show, text = '', progress = undefined) {
+      overlay.style.display = show ? 'flex' : 'none';
+      overlay.setAttribute('aria-hidden', show ? 'false' : 'true');
+      if (text) overlayText.textContent = text;
+      if (typeof progress === 'number') overlayBar.style.width = `${Math.max(0, Math.min(1, progress))*100}%`;
     }
 
-    // Create engine helper with progress callback
+    // Engine helper with progress callback (keeps overlay updates minimal)
     async function createEngineWithProgress() {
-        return await webllm.CreateMLCEngine(MODEL_ID, {
-            initProgressCallback: (report) => {
-                // ensure we clamp/format progress
-                const p = Math.max(0, Math.min(1, (report && report.progress) || 0));
-                setOverlay(true, report && report.text ? report.text : 'Downloading model...', p);
-            }
-        });
+      return await webllm.CreateMLCEngine(MODEL_ID, {
+        initProgressCallback: (report) => {
+          const p = Math.max(0, Math.min(1, (report && report.progress) || 0));
+          setOverlay(true, (report && report.text) || 'Downloading model...', p);
+        }
+      });
     }
 
-    // Build messages (system prompt with traits + limited recent history)
+    // Messages builder using dynamic history size based on low power toggle
     function buildMessages(userText) {
-        const systemPrompt = traitsToSystemPrompt(userTraits);
-        const turnsToKeep = HISTORY_TURNS * 2;
-        const recent = history.slice(-turnsToKeep).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
-        return [{ role: 'system', content: systemPrompt }, ...recent, { role: 'user', content: userText }];
+      const system = buildSystemPrompt();
+      const historyTurns = lowPower ? 0 : DEFAULT_HISTORY_TURNS;
+      const turnsToKeep = historyTurns * 2; // user+assistant entries
+      const recent = history.slice(-turnsToKeep).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+      const msgs = [{ role: 'system', content: system }, ...recent, { role: 'user', content: userText }];
+      return msgs;
     }
 
-    // Main chat flow (Method 4)
+    // Main chat (Method 4 lifecycle; immediate unload after final tokens)
     async function runChat() {
-        const text = input.value.trim();
-        if (!text) return;
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      appendMessage('user', text);
 
-        input.value = '';
-        appendMessage('user', text);
+      // Append placeholder assistant message to update during stream
+      const aiNode = appendMessage('assistant', '…');
 
-        // Optimistic UI: add assistant placeholder while we boot
-        const aiMsgDiv = appendMessage('ai', '…');
+      // Pre-engine UI repaint and block UI: show overlay before heavy work
+      setOverlay(true, 'Preparing engine…', 0);
+      await new Promise(requestAnimationFrame);
 
-        // Disable send and show overlay BEFORE heavy work to ensure repaint
-        sendBtn.disabled = true;
-        thinking.style.display = 'none'; // we use overlay as main blocker
+      sendBtn.disabled = true;
 
-        // Pre-engine UI repaint - allow the DOM to render the user message + overlay
-        setOverlay(true, 'Preparing engine…', 0);
-        // Wait for next repaint so the overlay + message are painted before heavy CPU/GPU work
-        await new Promise(requestAnimationFrame);
+      try {
+        engine = await createEngineWithProgress();
+        setOverlay(true, 'Starting inference…', 1);
 
-        try {
-            // Boot a fresh engine each call (stateless worker)
-            engine = await createEngineWithProgress();
-            setOverlay(true, 'Starting inference…', 1);
+        const messages = buildMessages(text);
 
-            const messages = buildMessages(text);
+        let reply = '';
+        const stream = await engine.chat.completions.create({ messages, stream: true });
 
-            // Streamed completions
-            let fullReply = "";
-            const chunks = await engine.chat.completions.create({ messages, stream: true });
-            for await (const chunk of chunks) {
-                const delta = chunk.choices?.[0]?.delta?.content || "";
-                fullReply += delta;
-                aiMsgDiv.innerText = fullReply || '…';
-                chatBox.scrollTop = chatBox.scrollHeight;
-            }
-
-            // Immediately unload engine to purge GPU memory (Method 4 Immediate Purge)
-            await engine.unload();
-            engine = null;
-
-            // Save conversation externally (JS array) and clamp size
-            history.push({ role: 'user', content: text }, { role: 'assistant', content: fullReply });
-            const maxEntries = HISTORY_TURNS * 2;
-            if (history.length > maxEntries) history = history.slice(-maxEntries);
-
-            setOverlay(false);
-
-        } catch (err) {
-            console.error(err);
-            appendMessage('ai', "I had a memory spike. Resetting to stay smooth.");
-            // ensure GPU is cleared
-            try { if (engine) { await engine.unload(); } } catch (e) { /* ignore */ }
-            engine = null;
-            setOverlay(false);
-        } finally {
-            sendBtn.disabled = false;
+        for await (const chunk of stream) {
+          const delta = chunk?.choices?.[0]?.delta?.content || '';
+          reply += delta;
+          aiNode.textContent = reply || '…';
+          chat.scrollTop = chat.scrollHeight;
         }
+
+        // Immediate purge
+        await engine.unload();
+        engine = null;
+
+        // Save externally
+        history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
+        const maxEntries = (lowPower ? 0 : DEFAULT_HISTORY_TURNS) * 2;
+        if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
+        if (maxEntries === 0) history = []; // keep empty in strict low-power
+
+        setOverlay(false);
+      } catch (err) {
+        console.error(err);
+        appendMessage('assistant', 'I hit a memory spike and reset. Try again.');
+        try { if (engine) await engine.unload(); } catch {}
+        engine = null;
+        setOverlay(false);
+      } finally {
+        sendBtn.disabled = false;
+      }
     }
 
-    // Reset functionality
-    resetBtn.onclick = async () => {
-        history = [];
-        chatBox.innerHTML = '<div class="msg ai">Memory purged. GPU is resting.</div>';
-        if (engine) {
-            try { await engine.unload(); } catch(e) { /* ignore */ }
-            engine = null;
-        }
-        input.value = '';
-        // Optionally clear traits (commented out; enable if desired)
-        // localStorage.removeItem(TRAITS_KEY);
-    };
+    // Reset: clear history and unload engine
+    resetBtn.addEventListener('click', async () => {
+      history = [];
+      chat.innerHTML = '<div class="msg assistant">Memory purged. Ready.</div>';
+      try { if (engine) { await engine.unload(); } } catch {}
+      engine = null;
+      input.value = '';
+    });
 
-    // Wiring
-    sendBtn.onclick = runChat;
-    input.onkeypress = (e) => { if (e.key === 'Enter') runChat(); };
+    // Low-power toggle wiring
+    lowPower = loadLowPower();
+    lowPowerToggle.checked = lowPower;
+    lowPowerToggle.addEventListener('change', () => {
+      lowPower = !!lowPowerToggle.checked;
+      saveLowPower(lowPower);
+      // immediate feedback: show small toast via overlay for a short time
+      setOverlay(true, lowPower ? 'Low Power: ON — minimizing context' : 'Low Power: OFF — normal mode', 0.3);
+      setTimeout(()=> setOverlay(false), 800);
+    });
 
-    // focus input for immediate typing
+    // Traits editor UI
+    function openTraitsModal() {
+      renderTraitsEditor();
+      modalOverlay.style.display = 'flex';
+      modalOverlay.setAttribute('aria-hidden', 'false');
+    }
+    function closeTraitsModal() {
+      modalOverlay.style.display = 'none';
+      modalOverlay.setAttribute('aria-hidden', 'true');
+    }
+    function renderTraitsEditor() {
+      traitsList.innerHTML = '';
+      for (let i = 0; i < Math.max(userTraits.length, 1); i++) {
+        const row = document.createElement('div');
+        row.className = 'trait-row';
+        const inputEl = document.createElement('input');
+        inputEl.type = 'text';
+        inputEl.value = userTraits[i] || '';
+        inputEl.placeholder = `Trait ${i+1}`;
+        inputEl.addEventListener('input', () => userTraits[i] = inputEl.value);
+        const del = document.createElement('button');
+        del.className = 'btn';
+        del.textContent = 'Remove';
+        del.addEventListener('click', () => {
+          userTraits.splice(i, 1);
+          renderTraitsEditor();
+        });
+        row.appendChild(inputEl);
+        row.appendChild(del);
+        traitsList.appendChild(row);
+      }
+    }
+    addTraitBtn.addEventListener('click', () => {
+      if (userTraits.length >= MAX_TRAITS) return;
+      userTraits.push('');
+      renderTraitsEditor();
+    });
+    saveTraitsBtn.addEventListener('click', () => {
+      // sanitize: trim and drop empties, keep max
+      userTraits = userTraits.map(s => (s || '').trim()).filter(Boolean).slice(0, MAX_TRAITS);
+      saveTraits(userTraits);
+      closeTraitsModal();
+      setOverlay(true, 'Traits saved', 0.2);
+      setTimeout(()=>setOverlay(false), 700);
+    });
+    cancelTraitsBtn.addEventListener('click', () => closeTraitsModal());
+    editTraitsBtn.addEventListener('click', openTraitsModal);
+
+    // Load initial traits (seed with small defaults if none)
+    userTraits = loadTraits();
+    if (userTraits.length === 0) {
+      userTraits = ['Concise', 'Numbered steps', 'English'];
+      saveTraits(userTraits);
+    }
+
+    // Wire send and Enter key
+    sendBtn.addEventListener('click', runChat);
+    input.addEventListener('keypress', (e) => { if (e.key === 'Enter') runChat(); });
+
+    // Accessibility: focus input
     input.focus();
-
-</script>
+  </script>
 </body>
 </html>
