@@ -84,6 +84,11 @@
           <input id="cotToggle" type="checkbox" />
         </label>
 
+        <!-- Always show reasoning inline toggle -->
+        <label class="toggle" title="Show reasoning inline">
+          <input id="showReasoningToggle" type="checkbox" />
+        </label>
+
         <button class="btn" id="traitsBtn">Traits</button>
         <button class="btn btn--danger" id="resetBtn">Reset</button>
       </div>
@@ -136,6 +141,7 @@
     const TRAITS_KEY = 'qwen_user_traits_v1';
     const LOWPOWER_KEY = 'qwen_lowpower_v1';
     const COT_KEY = 'qwen_cot_v1';
+    const SHOW_REASONING_KEY = 'qwen_show_reasoning_v1';
     const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1';
 
     // UI refs
@@ -149,6 +155,7 @@
     const overlayBar = document.getElementById('overlayBar');
     const lowPowerToggle = document.getElementById('lowPowerToggle');
     const cotToggle = document.getElementById('cotToggle');
+    const showReasoningToggle = document.getElementById('showReasoningToggle');
     const traitsBtn = document.getElementById('traitsBtn');
 
     // modal refs
@@ -164,6 +171,7 @@
     let userTraits = [];
     let lowPower = false;
     let cotEnabled = false;
+    let showReasoningInline = false;
     let history = [];
     let engine = null;
     const requestQueue = [];
@@ -176,6 +184,8 @@
     function saveLowPower(v){ try { localStorage.setItem(LOWPOWER_KEY, v ? '1' : '0'); } catch {} }
     function loadCoT(){ try { return localStorage.getItem(COT_KEY) === '1'; } catch { return false; } }
     function saveCoT(v){ try { localStorage.setItem(COT_KEY, v ? '1' : '0'); } catch {} }
+    function loadShowReasoning(){ try { return localStorage.getItem(SHOW_REASONING_KEY) === '1'; } catch { return false; } }
+    function saveShowReasoning(v){ try { localStorage.setItem(SHOW_REASONING_KEY, v ? '1' : '0'); } catch {} }
     function modelDownloadedFlag(){ try { return localStorage.getItem(MODEL_DOWNLOADED_KEY) === '1'; } catch { return false; } }
     function setModelDownloadedFlag(){ try { localStorage.setItem(MODEL_DOWNLOADED_KEY, '1'); } catch {} }
 
@@ -231,29 +241,34 @@
       return engine;
     }
 
-    // build a compact system prompt that includes probabilistic reasoning + CoT policy
+    // Compact traits encoding: short tags to minimize tokens (e.g., "t:concise,numbered,eng")
+    function compactTraitsTag(){
+      const traits = (userTraits || []).slice(0, MAX_TRAITS).map(t => t.replace(/\s+/g,' ').trim().toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ')[0]); // pick short word
+      if (!traits.length) return '';
+      // join with commas
+      return `t:${traits.slice(0, MAX_TRAITS).join(',')}`;
+    }
+
+    // build a compact system prompt that includes probabilistic reasoning + JSON-CoT policy
     function buildSystemPrompt(){
-      // compact trait line
-      const traits = lowPower ? userTraits.slice(0, LOWPOWER_TRAITS) : userTraits.slice(0, MAX_TRAITS);
-      const compact = traits.map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).join(' | ');
-      // Probabilistic reasoning guidance (short)
-      const prob = "Treat outputs as probabilistic predictions; avoid overconfidence. Provide a short certainty tag: [High|Medium|Low].";
-      // Chain-of-Thought guidance (brief and constrained)
+      // traits tag
+      const tag = compactTraitsTag();
+      // Probabilistic guidance (tiny)
+      const prob = "Outputs are probabilistic; include Certainty:[High|Medium|Low].";
+      // CoT JSON instruction (very compact)
       let cotInstr = "";
-      if (cotEnabled && !lowPower) {
-        // normal CoT: ask for up to 5 concise steps then "Answer:" and a certainty tag
-        cotInstr = "When enabled, produce up to 5 concise numbered reasoning steps, then a single-line final answer labeled 'Answer:'. End with 'Certainty: [High|Medium|Low]'. Keep steps short.";
-      } else if (cotEnabled && lowPower) {
-        // low-power CoT: force a 1-step micro-reasoning to limit cost
-        cotInstr = "CoT is enabled but device is in Low Power: provide a single concise step, then 'Answer:' and 'Certainty:'.";
+      const stepsLimit = (cotEnabled ? (lowPower ? 1 : 5) : 0);
+      if (cotEnabled) {
+        cotInstr = `Respond ONLY with a single JSON object: {"reasoning":[...short steps], "answer":"...", "certainty":"High|Medium|Low"}. Limit reasoning to ${stepsLimit} short items. No extra text.`;
       } else {
-        // CoT disabled
-        cotInstr = "Do not expose internal chain-of-thought; provide a concise direct answer and a short certainty tag.";
+        // No CoT: still require a JSON answer with empty reasoning array
+        cotInstr = `Respond ONLY with a single JSON object: {"reasoning":[], "answer":"...", "certainty":"High|Medium|Low"}. No extra text.`;
       }
 
-      const base = lowPower ? "Concise assistant. Keep replies extremely short." : "Concise assistant. Keep replies short.";
-      const systemRaw = compact ? `${base} User: ${compact}. ${prob} ${cotInstr}` : `${base} ${prob} ${cotInstr}`;
-      return clampString(systemRaw, SYSTEM_PROMPT_CHAR_CAP);
+      const base = lowPower ? "Be concise." : "Be concise.";
+      const parts = [base, tag, prob, cotInstr].filter(Boolean);
+      const system = parts.join(' ');
+      return clampString(system, SYSTEM_PROMPT_CHAR_CAP);
     }
 
     function buildMessages(userText){
@@ -264,40 +279,110 @@
       return [{ role: 'system', content: system }, ...recent, { role: 'user', content: userText }];
     }
 
-    // parse reasoning & answer from model reply if structured as steps + "Answer:"
-    function extractReasoningAndAnswer(fullText) {
+    // Extract JSON object from model reply text, fallback to legacy extraction
+    function extractJSONFromText(text) {
+      if (!text || !text.trim()) return null;
+      const first = text.indexOf('{');
+      const last = text.lastIndexOf('}');
+      if (first === -1 || last === -1 || last <= first) return null;
+      const maybe = text.slice(first, last + 1);
+      try {
+        const parsed = JSON.parse(maybe);
+        // Basic validation
+        if (parsed && (Array.isArray(parsed.reasoning) || typeof parsed.answer === 'string')) return parsed;
+      } catch (e) {
+        // try to fix common issues: single quotes -> double quotes
+        try {
+          const fixed = maybe.replace(/(['"])?([a-zA-Z0-9_]+)(['"])?:/g, '"$2":').replace(/'/g, '"');
+          const parsed2 = JSON.parse(fixed);
+          if (parsed2 && (Array.isArray(parsed2.reasoning) || typeof parsed2.answer === 'string')) return parsed2;
+        } catch (e2) {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    // fallback extraction when JSON not returned
+    function extractReasoningAndAnswerFallback(fullText) {
       // look for "Answer:" token (case-insensitive)
       const answerMatch = fullText.match(/Answer\s*:\s*([\s\S]*)$/i);
       if (answerMatch) {
         const answer = answerMatch[1].trim();
         const reasoningPart = fullText.slice(0, answerMatch.index).trim();
-        // Try to split reasoning into lines/steps
         const steps = reasoningPart ? reasoningPart.split(/\r?\n/).map(s => s.trim()).filter(Boolean) : [];
-        return { steps, answer };
+        return { steps, answer, certainty: null };
       }
-      // fallback: try to detect "Certainty:" suffix and split before it
+      // try to extract certainty
       const certMatch = fullText.match(/(.*)\nCertainty\s*:\s*(High|Medium|Low)/i);
       if (certMatch) {
-        const reasoningAndAnswer = certMatch[1].trim();
-        return { steps: [], answer: reasoningAndAnswer };
+        return { steps: [], answer: certMatch[1].trim(), certainty: certMatch[2] };
       }
-      // if nothing matched, return whole as answer without steps
-      return { steps: [], answer: fullText.trim() };
+      return { steps: [], answer: fullText.trim(), certainty: null };
     }
 
-    // UI: append assistant reply with optional hidden reasoning block and toggle
-    function renderAssistantReply(fullReply) {
-      // parse reply
-      const { steps, answer } = extractReasoningAndAnswer(fullReply);
+    // Render assistant reply: if JSON present, parse and render. Show reasoning inline if user toggled it on.
+    function renderAssistantReplyFromText(fullReply) {
+      const json = extractJSONFromText(fullReply);
+      if (json) {
+        const answerText = json.answer || '';
+        const certainty = json.certainty || '';
+        const steps = Array.isArray(json.reasoning) ? json.reasoning : [];
 
-      // create assistant message container
+        // assistant answer bubble
+        const assistantDiv = document.createElement('div');
+        assistantDiv.className = 'msg assistant';
+        assistantDiv.textContent = answerText + (certainty ? `\n\nCertainty: ${certainty}` : '');
+        chat.appendChild(assistantDiv);
+
+        if (steps.length > 0) {
+          const wrapper = document.createElement('div');
+          wrapper.style.display = 'flex';
+          wrapper.style.flexDirection = 'column';
+          wrapper.style.alignItems = 'flex-start';
+          wrapper.style.maxWidth = '78%';
+
+          const toggle = document.createElement('button');
+          toggle.className = 'btn';
+          toggle.textContent = showReasoningInline ? 'Hide reasoning' : 'Show reasoning';
+          toggle.style.marginTop = '6px';
+          toggle.style.padding = '6px 8px';
+          toggle.style.fontSize = '13px';
+
+          const reasoningBox = document.createElement('div');
+          reasoningBox.className = 'reasoning';
+          reasoningBox.style.display = showReasoningInline ? 'block' : 'none';
+
+          steps.forEach((s, i) => {
+            const stepEl = document.createElement('div');
+            stepEl.className = 'step';
+            stepEl.textContent = `${i+1}. ${s}`;
+            reasoningBox.appendChild(stepEl);
+          });
+
+          toggle.addEventListener('click', () => {
+            const visible = reasoningBox.style.display !== 'none';
+            reasoningBox.style.display = visible ? 'none' : 'block';
+            toggle.textContent = visible ? 'Show reasoning' : 'Hide reasoning';
+          });
+
+          wrapper.appendChild(toggle);
+          wrapper.appendChild(reasoningBox);
+          chat.appendChild(wrapper);
+        }
+
+        chat.scrollTop = chat.scrollHeight;
+        return;
+      }
+
+      // fallback: parse heuristically
+      const fallback = extractReasoningAndAnswerFallback(fullReply);
       const assistantDiv = document.createElement('div');
       assistantDiv.className = 'msg assistant';
-      assistantDiv.textContent = answer || fullReply || '…';
+      assistantDiv.textContent = fallback.answer || fullReply || '…';
       chat.appendChild(assistantDiv);
 
-      // if there are steps, attach a collapsed reasoning block with a show/hide button
-      if (steps && steps.length > 0) {
+      if (fallback.steps && fallback.steps.length) {
         const wrapper = document.createElement('div');
         wrapper.style.display = 'flex';
         wrapper.style.flexDirection = 'column';
@@ -306,19 +391,19 @@
 
         const toggle = document.createElement('button');
         toggle.className = 'btn';
-        toggle.textContent = 'Show reasoning';
+        toggle.textContent = showReasoningInline ? 'Hide reasoning' : 'Show reasoning';
         toggle.style.marginTop = '6px';
         toggle.style.padding = '6px 8px';
         toggle.style.fontSize = '13px';
 
         const reasoningBox = document.createElement('div');
         reasoningBox.className = 'reasoning';
-        reasoningBox.style.display = 'none';
-        // render steps
-        steps.forEach((s, i) => {
+        reasoningBox.style.display = showReasoningInline ? 'block' : 'none';
+
+        fallback.steps.forEach((s, i) => {
           const stepEl = document.createElement('div');
           stepEl.className = 'step';
-          stepEl.textContent = s;
+          stepEl.textContent = `${i+1}. ${s}`;
           reasoningBox.appendChild(stepEl);
         });
 
@@ -330,7 +415,6 @@
 
         wrapper.appendChild(toggle);
         wrapper.appendChild(reasoningBox);
-        // append wrapper after assistantDiv
         chat.appendChild(wrapper);
       }
 
@@ -349,20 +433,22 @@
       processing = false;
     }
 
-    // Handle single request implementing Method 4 and CoT constraints
+    // Handle single request implementing Method 4 and JSON-CoT constraints
     async function handleSingleRequest(userText) {
       const replyCharCap = lowPower ? REPLY_CHAR_CAP_LOW : REPLY_CHAR_CAP_NORMAL;
       const messages = buildMessages(userText);
 
-      // placeholder assistant node (we'll remove + replace after streaming completes)
-      const placeholder = appendMessage('assistant', '…');
+      // Decide whether to show placeholder: remove/avoid "thinking" when lowPower is ON
+      let placeholder = null;
+      if (!lowPower) {
+        placeholder = appendMessage('assistant', '…');
+      }
 
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
         showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
         await new Promise(requestAnimationFrame);
       } else {
-        // ensure a frame to keep UI smooth
         await new Promise(requestAnimationFrame);
       }
 
@@ -378,26 +464,25 @@
           const delta = chunk?.choices?.[0]?.delta?.content || '';
           if (delta) {
             fullReply += delta;
-            // Show streaming text in placeholder so user sees progress
-            placeholder.textContent = fullReply;
-            // enforce cap to avoid runaway
+            // update placeholder only when not lowPower
+            if (placeholder) placeholder.textContent = fullReply;
             if (fullReply.length > replyCharCap) {
               fullReply = fullReply.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
-              placeholder.textContent = fullReply;
-              // Attempt to break out of stream early by breaking; the stream for-await may still require cleanup
+              if (placeholder) placeholder.textContent = fullReply;
               break;
             }
             chat.scrollTop = chat.scrollHeight;
           }
         }
 
-        // ensure full unload immediately
         try { await engine.unload(); } catch(e) {}
         engine = null;
 
-        // remove placeholder and render structured assistant reply
-        placeholder.remove();
-        renderAssistantReply(fullReply);
+        // remove placeholder if present
+        if (placeholder) placeholder.remove();
+
+        // Render parsed JSON-like reply; if JSON isn't present, fallback rendering is used
+        renderAssistantReplyFromText(fullReply);
 
         // persist history externally
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
@@ -408,7 +493,7 @@
         hideOverlay();
       } catch (err) {
         console.error('Inference error', err);
-        placeholder.remove();
+        if (placeholder) placeholder.remove();
         appendMessage('assistant', 'I had a memory spike or connection error. Try again in a moment.');
         try { if (engine) await engine.unload(); } catch(e){}
         engine = null;
@@ -442,7 +527,7 @@
       requestQueue.length = 0;
       try { if (engine) await engine.unload(); } catch(e) {}
       engine = null;
-      // Do not clear model downloaded flag so overlay won't reappear
+      // do not clear modelDownloaded flag so overlay won't reappear
     });
 
     // Low-power toggle wiring
@@ -465,11 +550,9 @@
     // CoT toggle wiring
     cotEnabled = loadCoT();
     cotToggle.checked = cotEnabled;
-    // if lowPower true, force cotDisabled
     if (lowPower && cotEnabled) { cotEnabled = false; cotToggle.checked = false; saveCoT(false); }
     cotToggle.addEventListener('change', (e) => {
       const requested = !!e.target.checked;
-      // disallow enabling CoT when lowPower is ON
       if (lowPower && requested) {
         cotToggle.checked = false;
         cotEnabled = false;
@@ -479,7 +562,16 @@
       }
       cotEnabled = requested;
       saveCoT(cotEnabled);
-      appendMessage('assistant', cotEnabled ? 'Reasoning enabled.' : 'Reasoning disabled.');
+      appendMessage('assistant', cotEnabled ? 'Reasoning enabled (JSON output).' : 'Reasoning disabled.');
+    });
+
+    // Show reasoning inline toggle
+    showReasoningInline = loadShowReasoning();
+    showReasoningToggle.checked = showReasoningInline;
+    showReasoningToggle.addEventListener('change', (e) => {
+      showReasoningInline = !!e.target.checked;
+      saveShowReasoning(showReasoningInline);
+      appendMessage('assistant', showReasoningInline ? 'Reasoning will be shown inline.' : 'Reasoning will be hidden by default.');
     });
 
     // Traits editor wiring
@@ -525,8 +617,14 @@
     }
     lowPower = loadLowPower();
     cotEnabled = loadCoT();
+    showReasoningInline = loadShowReasoning();
     // ensure CoT disabled while in Low Power
     if (lowPower && cotEnabled) { cotEnabled = false; cotToggle.checked = false; saveCoT(false); }
+
+    // sync toggles visually after load
+    lowPowerToggle.checked = lowPower;
+    cotToggle.checked = cotEnabled;
+    showReasoningToggle.checked = showReasoningInline;
 
     // focus input
     userInput.focus();
