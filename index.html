@@ -22,7 +22,7 @@
     .btn{background:transparent;border:1px solid rgba(0,0,0,0.06);padding:6px 10px;border-radius:12px;font-size:13px;cursor:pointer;box-shadow:0 1px 0 rgba(255,255,255,0.6)}
     .btn--danger{color:#ff3b30;border-color:rgba(255,59,48,0.12)}
     .toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
-    .toggle input{width:40px;height:22px;appearance:none;background:#e9e9ef;border-radius:11px;position:relative;outline:none;cursor:pointer}
+    .toggle input{width:40px;height:22px;appearance:none;background:#e9eef;border-radius:11px;position:relative;outline:none;cursor:pointer}
     .toggle input:after{content:"";position:absolute;left:3px;top:3px;width:16px;height:16px;border-radius:8px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,0.06);transition:transform 160ms ease}
     .toggle input:checked{background:linear-gradient(90deg,var(--primary),var(--accent))}
     .toggle input:checked:after{transform:translateX(18px)}
@@ -32,7 +32,7 @@
     .assistant{align-self:flex-start;background:#fff;color:#0b1220;border-bottom-left-radius:6px}
     .muted{font-size:12px;color:var(--muted)}
     .input-row{display:flex;padding:10px;gap:8px;border-top:1px solid rgba(0,0,0,0.04);background:linear-gradient(180deg, rgba(255,255,255,0.95), transparent)}
-    input[type="text"]{flex:1;padding:12px;border-radius:18px;border:1px solid #e9e9ef;font-size:15px;background:#fff}
+    input[type="text"]{flex:1;padding:12px;border-radius:18px;border:1px solid #e9eef;font-size:15px;background:#fff}
     button#send{background:linear-gradient(90deg,var(--primary),var(--accent));color:#fff;border:none;padding:10px 14px;border-radius:14px;cursor:pointer;box-shadow:0 6px 18px rgba(0,122,255,0.12)}
     button:disabled{opacity:0.5;cursor:not-allowed}
 
@@ -50,8 +50,14 @@
     .traitsEditor input{padding:8px;border-radius:8px;border:1px solid #eee}
     .modalActions{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
 
-    /* thinking & reveal */
-    .thinking {font-style:italic;color:var(--muted);padding:8px 12px;border-radius:12px;background:transparent;border:1px dashed rgba(0,0,0,0.04);max-width:78%}
+    /* thinking pulsing animation */
+    @keyframes pulse {
+      0% { opacity: 0.6; transform: translateY(0); }
+      50% { opacity: 1; transform: translateY(-2px); }
+      100% { opacity: 0.6; transform: translateY(0); }
+    }
+    .thinking { font-style:italic;color:var(--muted);padding:8px 12px;border-radius:12px;background:transparent;border:1px dashed rgba(0,0,0,0.04);max-width:78%; animation: pulse 1.2s ease-in-out infinite; }
+
     .fade-in { animation: fadeIn 360ms ease; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0); } }
 
@@ -169,7 +175,7 @@
     let processing = false;
 
     // windowed message rendering (keeps DOM small but allows viewing full convo)
-    const allMessages = [];           // full in-memory conversation (objects: {role, text})
+    const allMessages = [];           // full in-memory conversation (objects: {role, text, className?})
     let displayStart = 0;             // index in allMessages where DOM window begins
     const MESSAGE_WINDOW = MAX_MESSAGES_IN_DOM; // how many messages to show at once
     let userIsNearBottom = true;      // whether to auto-scroll when new message arrives
@@ -179,13 +185,11 @@
       chat.addEventListener('scroll', () => {
         const near = (chat.scrollTop + chat.clientHeight) >= (chat.scrollHeight - 80);
         userIsNearBottom = near;
-        // (Could show "New messages" hint if !near)
       }, { passive: true });
     })();
 
     // render the window [displayStart .. displayStart + MESSAGE_WINDOW)
     function renderMessageWindow() {
-      // clear chat, re-render only the window slice
       chat.innerHTML = '';
 
       // if there are older messages above displayStart, show a "Load earlier" control
@@ -210,9 +214,30 @@
       for (let i = displayStart; i < end; i++) {
         const m = allMessages[i];
         const d = document.createElement('div');
-        d.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        d.className = (m.className ? m.className + ' ' : '') + 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
         d.textContent = m.text;
         chat.appendChild(d);
+      }
+
+      // if there are newer messages not shown, provide "Load newer" control at bottom
+      if ((displayStart + MESSAGE_WINDOW) < allMessages.length) {
+        const newerBtn = document.createElement('button');
+        newerBtn.className = 'btn';
+        newerBtn.textContent = 'Load newer';
+        newerBtn.style.margin = '6px 0';
+        newerBtn.addEventListener('click', () => {
+          // move window forward
+          const maxStart = Math.max(0, allMessages.length - MESSAGE_WINDOW);
+          displayStart = Math.min(maxStart, displayStart + MESSAGE_WINDOW);
+          renderMessageWindow();
+          // scroll a bit to keep context
+          requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+        });
+        const wrapper2 = document.createElement('div');
+        wrapper2.style.display = 'flex';
+        wrapper2.style.justifyContent = 'center';
+        wrapper2.appendChild(newerBtn);
+        chat.appendChild(wrapper2);
       }
 
       if (userIsNearBottom) {
@@ -221,10 +246,17 @@
     }
 
     // Add a new message to the in-memory list and update rendered window appropriately.
+    // opts: {className: string}
     function appendMessageWindowed(role, text, opts = {}) {
-      // push to full convo store (cap stored messages to avoid infinite growth)
-      allMessages.push({ role, text });
-      if (allMessages.length > ALL_MESSAGES_STORE_CAP) allMessages.shift();
+      const entry = { role, text, className: opts.className || '' };
+      allMessages.push(entry);
+
+      // cap store
+      if (allMessages.length > ALL_MESSAGES_STORE_CAP) {
+        // if we're showing the oldest block, shift displayStart down to account for removed element
+        const removed = allMessages.shift();
+        if (displayStart > 0) displayStart = Math.max(0, displayStart - 1);
+      }
 
       const showingTail = (displayStart + MESSAGE_WINDOW) >= (allMessages.length - 1);
 
@@ -235,10 +267,7 @@
       }
 
       renderMessageWindow();
-
-      if (userIsNearBottom || showingTail) {
-        requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
-      }
+      // don't force-scroll if user reading history; renderMessageWindow will only auto-scroll if near bottom
     }
 
     // convenience alias used in older code paths
@@ -353,16 +382,6 @@
       return false;
     }
 
-    // small non-cryptographic hash for cache keys
-    function hashString(s) {
-      let h = 2166136261 >>> 0;
-      for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = Math.imul(h, 16777619) >>> 0;
-      }
-      return h.toString(16);
-    }
-
     // aggressive reset and retry (unload, prune DOM, probe, retry)
     async function aggressiveResetAndRetry(originalUserText) {
       appendMessage('assistant', 'Trying to refresh my mind...');
@@ -440,9 +459,8 @@
       const replyCharCap = REPLY_CHAR_CAP_LOW;
       const messages = buildMessages(userText);
 
-      const thinkingElIndex = allMessages.length; // we'll append thinking via appendMessage
+      // Append thinking placeholder (will be removed and replaced later)
       appendMessage('assistant', 'Thinking...', { className: 'thinking' });
-      // preserve reference to the placeholder by remembering its position in allMessages
 
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
@@ -455,7 +473,6 @@
       sendBtn.disabled = true;
       let localEngine = null;
       let fullReply = '';
-      let streamCompleted = false;
 
       try {
         localEngine = await createEngineWithProgress();
@@ -473,7 +490,6 @@
             if (fullReply.length % 200 === 0) await new Promise(requestAnimationFrame);
           }
         }
-        streamCompleted = true;
 
         try { await localEngine.unload(); } catch(e) { console.warn('error unloading after stream', e); }
         engine = null;
@@ -497,26 +513,27 @@
 
         await new Promise(resolve => setTimeout(resolve, adjustedDelay));
 
-        // Replace the thinking placeholder by removing the appropriate earliest 'Thinking...' occurrence
-        // Find the first 'thinking' message in allMessages from thinkingElIndex onwards
+        // Remove the earliest 'Thinking...' placeholder (search for text + className)
         let removed = false;
-        for (let i = thinkingElIndex; i < allMessages.length; i++) {
-          if (allMessages[i] && allMessages[i].text === 'Thinking...') {
-            allMessages.splice(i, 1); // remove placeholder
+        for (let i = 0; i < allMessages.length; i++) {
+          if (allMessages[i] && allMessages[i].text === 'Thinking...' && allMessages[i].className && allMessages[i].className.includes('thinking')) {
+            allMessages.splice(i, 1);
             removed = true;
-            // adjust displayStart if needed
             if (displayStart > 0) displayStart = Math.max(0, displayStart - 1);
             break;
           }
         }
         if (!removed) {
-          // fallback: if not found, try a simple pop if last element is 'Thinking...'
-          if (allMessages.length && allMessages[allMessages.length - 1].text === 'Thinking...') {
-            allMessages.pop();
+          // fallback: remove first 'Thinking...' text even without class
+          for (let i = 0; i < allMessages.length; i++) {
+            if (allMessages[i] && allMessages[i].text === 'Thinking...') {
+              allMessages.splice(i, 1);
+              if (displayStart > 0) displayStart = Math.max(0, displayStart - 1);
+              break;
+            }
           }
         }
 
-        // Append the real answer
         appendMessage('assistant', extractAnswer(fullReply));
 
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
