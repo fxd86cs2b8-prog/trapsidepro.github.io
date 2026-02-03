@@ -64,7 +64,7 @@
 </head>
 <body>
   <div class="card" id="card">
-    <!-- small overlay used for progress + to block input -->
+    <!-- small overlay used for progress ONLY on first-time download -->
     <div class="overlay" id="overlay" aria-hidden="true">
       <div class="progressModal" id="progressModal" role="status" aria-live="polite">
         <div style="font-weight:600" id="overlayTitle">Preparing model…</div>
@@ -130,6 +130,7 @@
     const SYSTEM_PROMPT_CHAR_CAP = 420;  // maximum chars for system prompt to avoid large starts
     const TRAITS_KEY = 'qwen_user_traits_v1';
     const LOWPOWER_KEY = 'qwen_lowpower_v1';
+    const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1'; // new: remember first-time download
 
     // UI refs
     const chat = document.getElementById('chat');
@@ -167,6 +168,8 @@
     function saveTraits(arr){ try { localStorage.setItem(TRAITS_KEY, JSON.stringify((arr||[]).slice(0,MAX_TRAITS))); } catch {} }
     function loadLowPower(){ try { return localStorage.getItem(LOWPOWER_KEY) === '1'; } catch { return false; } }
     function saveLowPower(v){ try { localStorage.setItem(LOWPOWER_KEY, v ? '1' : '0'); } catch {} }
+    function modelDownloadedFlag(){ try { return localStorage.getItem(MODEL_DOWNLOADED_KEY) === '1'; } catch { return false; } }
+    function setModelDownloadedFlag(){ try { localStorage.setItem(MODEL_DOWNLOADED_KEY, '1'); } catch {} }
 
     // Small helpers
     function appendMessage(role, text){
@@ -184,7 +187,7 @@
       return s.slice(0, maxChars-3) + '...';
     }
 
-    // Overlay controls
+    // Overlay controls (note: overlay only used for first-time download)
     function showOverlay(title='Preparing model…', sub='Optimizing for low-memory', progress=0){
       overlayTitle.textContent = title;
       overlaySub.textContent = sub;
@@ -195,13 +198,39 @@
     function hideOverlay(){ overlay.style.display = 'none'; overlay.setAttribute('aria-hidden','true'); overlayBar.style.width = '0%'; }
 
     // Engine create with progress callback
-    async function createEngineWithProgress(){
-      return webllm.CreateMLCEngine(MODEL_ID, {
+    async function createEngineWithProgress() {
+      // Decide whether we should show overlay for this run:
+      // Only show when model has never been downloaded (first-time). If the MODEL_DOWNLOADED_KEY exists, suppress overlay.
+      const alreadyDownloaded = modelDownloadedFlag();
+      let downloadObserved = false; // did we observe any progress < 1 (actual download) this run?
+
+      const engine = await webllm.CreateMLCEngine(MODEL_ID, {
         initProgressCallback: (report) => {
           const p = Math.max(0, Math.min(1, (report && report.progress) || 0));
-          showOverlay(report && report.text ? report.text : 'Downloading model…', 'Optimized for mobile', p);
+          const text = (report && report.text) || '';
+
+          if (!alreadyDownloaded) {
+            // Only show the overlay if we haven't seen a prior complete download marker.
+            // Show during progress phases (p < 1). When p >= 1, if we observed p<1 earlier, mark as downloaded.
+            if (p < 1) {
+              downloadObserved = true;
+              showOverlay(text || 'Downloading model…', 'This happens only once on this device', p);
+            } else {
+              // progress reached completion
+              if (downloadObserved) {
+                // This run performed a real download — remember so next boots won't show overlay
+                setModelDownloadedFlag();
+              }
+              hideOverlay();
+            }
+          } else {
+            // already downloaded on this device — do nothing (suppress overlay entirely)
+            // (We intentionally do not call showOverlay here)
+          }
         }
       });
+
+      return engine;
     }
 
     // Build a tight system prompt — compressed and capped
@@ -245,27 +274,34 @@
       // Optimistically append placeholders to the UI (we already did for the queued call)
       const aiNode = appendMessage('assistant','…');
 
-      // Pre-render overlay to avoid freeze
-      showOverlay('Preparing engine…','Please wait',0);
-      await new Promise(requestAnimationFrame);
+      // Pre-render overlay to avoid freeze, but only if it's the real first-time download.
+      const alreadyDownloaded = modelDownloadedFlag();
+      if (!alreadyDownloaded) {
+        // show a title while we prepare for the download (only visible on first-time)
+        showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
+        // ensure the DOM paints
+        await new Promise(requestAnimationFrame);
+      } else {
+        // Do not show overlay; still yield a frame for smoothness
+        await new Promise(requestAnimationFrame);
+      }
 
       sendBtn.disabled = true;
 
       try {
+        // Boot engine; createEngineWithProgress will itself decide whether to display progress overlay
         engine = await createEngineWithProgress();
-        showOverlay('Starting inference…','Streaming response',1);
 
-        let fullReply = '';
-        // create streaming completion; handle as an async iterable
+        // If overlay was suppressed because model previously downloaded, createEngineWithProgress will not show it.
+        // Continue to inference
         const chunks = await engine.chat.completions.create({ messages, stream: true });
 
-        // Abort logic: break when reply length exceeds cap
+        let fullReply = '';
         for await (const chunk of chunks) {
           const delta = chunk?.choices?.[0]?.delta?.content || '';
-          if(delta){
+          if (delta) {
             fullReply += delta;
-            // If the reply is getting too large, stop early
-            if(fullReply.length > replyCharCap){
+            if (fullReply.length > replyCharCap) {
               fullReply = fullReply.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
               aiNode.textContent = fullReply;
               break;
@@ -275,15 +311,15 @@
           }
         }
 
-        // Ensure immediate purge of GPU memory
-        try { await engine.unload(); } catch (e) { /* ignore */ }
+        // Immediate purge
+        try { await engine.unload(); } catch(e) { /* ignore */ }
         engine = null;
 
         // Persist externally and clamp history
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
         const maxEntries = (lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL) * 2;
-        if(maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
-        if(maxEntries === 0) history = [];
+        if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
+        if (maxEntries === 0) history = [];
 
         hideOverlay();
       } catch (err) {
@@ -327,6 +363,7 @@
       // try unload
       try { if(engine) await engine.unload(); } catch {}
       engine = null;
+      // Note: do NOT clear the downloaded flag so users don't see the download overlay again.
     });
 
     // Low power toggle
@@ -335,8 +372,16 @@
     lowPowerToggle.addEventListener('change', (e) => {
       lowPower = !!e.target.checked;
       saveLowPower(lowPower);
-      showOverlay(lowPower ? 'Low Power: ON' : 'Low Power: OFF', lowPower ? 'Context is minimized' : 'Normal mode', 0.25);
-      setTimeout(()=>hideOverlay(), 700);
+      // brief non-blocking toast via overlay only if first-time model download hasn't happened
+      const alreadyDownloaded = modelDownloadedFlag();
+      if (!alreadyDownloaded) {
+        showOverlay(lowPower ? 'Low Power: ON' : 'Low Power: OFF', lowPower ? 'Context is minimized' : 'Normal mode', 0.25);
+        setTimeout(()=>hideOverlay(), 700);
+      } else {
+        // if model already downloaded, do minimal visual feedback (no overlay)
+        // flash a small ephemeral assistant message
+        appendMessage('assistant', lowPower ? 'Low Power enabled — context minimized.' : 'Low Power disabled — normal mode.');
+      }
     });
 
     // Traits editor
@@ -374,8 +419,13 @@
       userTraits = userTraits.map(s => (s || '').trim()).filter(Boolean).slice(0, MAX_TRAITS);
       saveTraits(userTraits);
       closeTraits();
-      showOverlay('Traits saved','Applied to next requests',0.3);
-      setTimeout(()=>hideOverlay(),600);
+      // feedback (no overlay if model already downloaded)
+      if (!modelDownloadedFlag()) {
+        showOverlay('Traits saved','They will be included on next boot if needed',0.3);
+        setTimeout(()=>hideOverlay(),600);
+      } else {
+        appendMessage('assistant', 'Traits saved.');
+      }
     });
     cancelTraitsBtn.addEventListener('click', () => closeTraits());
     traitsBtn.addEventListener('click', () => openTraits());
