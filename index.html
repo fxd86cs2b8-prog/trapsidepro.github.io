@@ -15,7 +15,7 @@
       --bg1:#e6efff; --bg2:#f4f7fb; --primary:#007AFF; --accent:#5856D6; --muted:#8e8e93; --card:rgba(255,255,255,0.92);
     }
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(160deg,var(--bg1),var(--bg2));-webkit-font-smoothing:antialiased}
-    .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-shadow:0 8px 30px rgba(21,28,40,0.08)}
+    .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-shadow:0 6px 20px rgba(6,10,18,0.06)}
     header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.04);background:linear-gradient(180deg, rgba(255,255,255,0.95), transparent)}
     .title{font-weight:700;color:#0b1220}
     .controls{display:flex;gap:8px;align-items:center}
@@ -124,19 +124,22 @@
   <script type="module">
     import * as webllm from "@mlc-ai/web-llm";
 
-    // Config and caps
+    // Config and caps (tuned for low-RAM devices)
     const MODEL_ID = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC";
     const MAX_TRAITS = 7;
-    const LOWPOWER_TRAITS = 3;
+    const LOWPOWER_TRAITS = 2;
     const HISTORY_TURNS_NORMAL = 1;      // user+assistant
     const HISTORY_TURNS_LOW = 0;
     const REPLY_CHAR_CAP_NORMAL = 2400;  // ~600 tokens estimate
     const REPLY_CHAR_CAP_LOW = 900;      // strict low-power
+    const ONDEMAND_CHAR_CAP = 700;       // cap for on-demand reasoning
     const SYSTEM_PROMPT_CHAR_CAP = 420;  // cap system prompt
     const TRAITS_KEY = 'qwen_user_traits_v1';
     const LOWPOWER_KEY = 'qwen_lowpower_v1';
     const COT_KEY = 'qwen_cot_v1';
     const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1';
+    const REASONING_CACHE_KEY = 'qwen_reasoning_cache_v1';
+    const MAX_MESSAGES_IN_DOM = 10;      // keep DOM light
 
     // UI refs
     const chat = document.getElementById('chat');
@@ -165,7 +168,7 @@
     let lowPower = false;
     let cotEnabled = false;
     let history = [];
-    let engine = null;
+    let engine = null; // keep for potential unload in reset
     const requestQueue = [];
     let processing = false;
 
@@ -179,13 +182,45 @@
     function modelDownloadedFlag(){ try { return localStorage.getItem(MODEL_DOWNLOADED_KEY) === '1'; } catch { return false; } }
     function setModelDownloadedFlag(){ try { localStorage.setItem(MODEL_DOWNLOADED_KEY, '1'); } catch {} }
 
+    // simple bounded reasoning cache stored in localStorage (small LRU-ish)
+    function loadReasoningCache(){
+      try {
+        const raw = localStorage.getItem(REASONING_CACHE_KEY);
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return obj && typeof obj === 'object' ? obj : {};
+      } catch { return {}; }
+    }
+    function saveReasoningCache(cache){
+      try {
+        // keep cache small: keep last 50 entries
+        const keys = Object.keys(cache || {});
+        if (keys.length > 50) {
+          // remove oldest by timestamp
+          keys.sort((a,b) => cache[a].t - cache[b].t);
+          for (let i=0;i<keys.length-50;i++) delete cache[keys[i]];
+        }
+        localStorage.setItem(REASONING_CACHE_KEY, JSON.stringify(cache));
+      } catch {}
+    }
+    function getCachedReasoning(key){ const c = loadReasoningCache(); return c[key] ? c[key].v : null; }
+    function setCachedReasoning(key, value){ const c = loadReasoningCache(); c[key] = { v: value, t: Date.now() }; saveReasoningCache(c); }
+
     // helpers
     function appendMessage(role, text){
+      // limit DOM message growth: remove the oldest if too many
+      if (chat.children.length >= MAX_MESSAGES_IN_DOM) {
+        // remove second child (keep header or initial?) but simpler: remove chat.firstChild until under limit
+        while (chat.children.length >= MAX_MESSAGES_IN_DOM) {
+          chat.removeChild(chat.firstChild);
+        }
+      }
       const d = document.createElement('div');
       d.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
       d.textContent = text;
       chat.appendChild(d);
-      chat.scrollTop = chat.scrollHeight;
+      // small delay to allow DOM update before scroll to avoid jank
+      requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
       return d;
     }
 
@@ -195,22 +230,32 @@
       return s.slice(0, maxChars - 3) + '...';
     }
 
-    // overlay controls (first-time only)
+    // overlay controls (first-time only) — throttle updates to reduce DOM churn
+    let lastOverlayProgress = -1;
     function showOverlay(title='Preparing model…', sub='Optimizing for low-memory', progress=0){
+      const p = Math.max(0, Math.min(1, progress));
+      // update only if change >= 2% to avoid frequent writes
+      if (Math.abs(p - lastOverlayProgress) < 0.02 && overlay.style.display === 'flex') {
+        overlayTitle.textContent = title;
+        overlaySub.textContent = sub;
+        return;
+      }
+      lastOverlayProgress = p;
       overlayTitle.textContent = title;
       overlaySub.textContent = sub;
-      overlayBar.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
+      overlayBar.style.width = `${Math.round(p * 100)}%`;
       overlay.style.display = 'flex';
       overlay.setAttribute('aria-hidden', 'false');
     }
-    function hideOverlay(){ overlay.style.display = 'none'; overlay.setAttribute('aria-hidden', 'true'); overlayBar.style.width = '0%'; }
+    function hideOverlay(){ overlay.style.display = 'none'; overlay.setAttribute('aria-hidden', 'true'); overlayBar.style.width = '0%'; lastOverlayProgress = -1; }
 
     // Engine create with progress callback — sets downloaded flag on real download
     async function createEngineWithProgress() {
       const alreadyDownloaded = modelDownloadedFlag();
       let downloadObserved = false;
 
-      const engine = await webllm.CreateMLCEngine(MODEL_ID, {
+      // keep a local reference during creation so we can unload on errors
+      const eng = await webllm.CreateMLCEngine(MODEL_ID, {
         initProgressCallback: (report) => {
           const p = Math.max(0, Math.min(1, (report && report.progress) || 0));
           const text = (report && report.text) || '';
@@ -218,20 +263,21 @@
           if (!alreadyDownloaded) {
             if (p < 1) {
               downloadObserved = true;
+              // show overlay throttled
               showOverlay(text || 'Downloading model…', 'This happens only once on this device', p);
             } else {
               if (downloadObserved) setModelDownloadedFlag();
               hideOverlay();
             }
           }
-          // if already downloaded, suppress any overlay
+          // if already downloaded, suppress overlay for smoothness
         }
       });
 
-      return engine;
+      return eng;
     }
 
-    // build a compact system prompt that includes probabilistic reasoning + CoT policy
+    // build compact system prompt that includes probabilistic reasoning + CoT policy
     function buildSystemPrompt(){
       // compact trait line
       const traits = lowPower ? userTraits.slice(0, LOWPOWER_TRAITS) : userTraits.slice(0, MAX_TRAITS);
@@ -241,13 +287,10 @@
       // Chain-of-Thought guidance (brief and constrained)
       let cotInstr = "";
       if (cotEnabled && !lowPower) {
-        // normal CoT: ask for up to 5 concise steps then "Answer:" and a certainty tag
-        cotInstr = "When enabled, produce up to 5 concise numbered reasoning steps, then a single-line final answer labeled 'Answer:'. End with 'Certainty: [High|Medium|Low]'. Keep steps short.";
+        cotInstr = "When enabled, produce up to 3 concise numbered reasoning steps, then a single-line final answer labeled 'Answer:'. End with 'Certainty: [High|Medium|Low]'. Keep steps short.";
       } else if (cotEnabled && lowPower) {
-        // low-power CoT: force a 1-step micro-reasoning to limit cost
         cotInstr = "CoT is enabled but device is in Low Power: provide a single concise step, then 'Answer:' and 'Certainty:'.";
       } else {
-        // CoT disabled
         cotInstr = "Do not expose internal chain-of-thought; provide a concise direct answer and a short certainty tag.";
       }
 
@@ -266,6 +309,7 @@
 
     // parse reasoning & answer from model reply if structured as steps + "Answer:"
     function extractReasoningAndAnswer(fullText) {
+      if (!fullText) return { steps: [], answer: '' };
       // look for "Answer:" token (case-insensitive)
       const answerMatch = fullText.match(/Answer\s*:\s*([\s\S]*)$/i);
       if (answerMatch) {
@@ -285,19 +329,19 @@
       return { steps: [], answer: fullText.trim() };
     }
 
-    // UI: append assistant reply with optional hidden reasoning block and toggle
-    function renderAssistantReply(fullReply) {
-      // parse reply
+    // UI: render assistant reply with optional on-demand reasoning button
+    // note: userText should be passed so explain requests can reference original question
+    function renderAssistantReply(fullReply, userText) {
       const { steps, answer } = extractReasoningAndAnswer(fullReply);
 
-      // create assistant message container
+      // assistant message container
       const assistantDiv = document.createElement('div');
       assistantDiv.className = 'msg assistant';
       assistantDiv.textContent = answer || fullReply || '…';
       chat.appendChild(assistantDiv);
 
-      // if there are steps, attach a collapsed reasoning block with a show/hide button
-      if (steps && steps.length > 0) {
+      // helper to create collapsed reasoning UI
+      function createReasoningUI(stepsArr) {
         const wrapper = document.createElement('div');
         wrapper.style.display = 'flex';
         wrapper.style.flexDirection = 'column';
@@ -315,7 +359,7 @@
         reasoningBox.className = 'reasoning';
         reasoningBox.style.display = 'none';
         // render steps
-        steps.forEach((s, i) => {
+        stepsArr.forEach((s) => {
           const stepEl = document.createElement('div');
           stepEl.className = 'step';
           stepEl.textContent = s;
@@ -330,11 +374,115 @@
 
         wrapper.appendChild(toggle);
         wrapper.appendChild(reasoningBox);
-        // append wrapper after assistantDiv
         chat.appendChild(wrapper);
       }
 
-      chat.scrollTop = chat.scrollHeight;
+      if (steps && steps.length > 0) {
+        // model already provided steps — show collapsed block
+        createReasoningUI(steps);
+      } else {
+        // no reasoning present in reply -> provide "Explain" button (on-demand micro-CoT)
+        const explainBtn = document.createElement('button');
+        explainBtn.className = 'btn';
+        explainBtn.textContent = 'Explain';
+        explainBtn.style.marginTop = '6px';
+        explainBtn.style.padding = '6px 8px';
+        explainBtn.style.fontSize = '13px';
+
+        explainBtn.addEventListener('click', async () => {
+          explainBtn.disabled = true;
+          // compute cache key based on question + answer snippet
+          const key = `k:${hashString((userText || '') + '||' + (answer || fullReply || ''))}`;
+          const cached = getCachedReasoning(key);
+          if (cached) {
+            createReasoningUI(cached);
+            explainBtn.disabled = false;
+            return;
+          }
+
+          // small char cap for on-demand reasoning to preserve performance
+          const ONDEMAND_STEP_LIMIT = lowPower ? 1 : 2; // 1 step in low power, else 2
+          const perStepChar = 120;
+
+          // build strict system instruction for micro-CoT
+          const sys = clampString(`Produce up to ${ONDEMAND_STEP_LIMIT} concise numbered reasoning steps (each <= ${perStepChar} chars). Then a single-line 'Answer:' and 'Certainty: [High|Medium|Low]'. No extra commentary.`, 380);
+
+          const prompt = `Question: ${userText || '[unknown]'}\nAnswer: ${answer || fullReply || '[unknown]'}\nProvide only the concise reasoning steps and final Answer/Certainty.`;
+
+          // small placeholder while fetching
+          const fetchingBox = document.createElement('div');
+          fetchingBox.className = 'reasoning';
+          fetchingBox.style.display = 'block';
+          fetchingBox.textContent = 'Fetching explanation…';
+          chat.appendChild(fetchingBox);
+          chat.scrollTop = chat.scrollHeight;
+
+          let eng = null;
+          try {
+            eng = await createEngineWithProgress();
+            // create small messages
+            const messages = [{ role: 'system', content: sys }, { role: 'user', content: prompt }];
+
+            // stream and collect until cap or complete
+            const chunks = await eng.chat.completions.create({ messages, stream: true });
+            let reasoningText = '';
+            for await (const chunk of chunks) {
+              const delta = chunk?.choices?.[0]?.delta?.content || '';
+              if (delta) {
+                reasoningText += delta;
+                // limit to ONDEMAND_CHAR_CAP to avoid runaway
+                if (reasoningText.length > ONDEMAND_CHAR_CAP) {
+                  reasoningText = reasoningText.slice(0, ONDEMAND_CHAR_CAP) + '\n\n[truncated]';
+                  break;
+                }
+              }
+            }
+
+            // unload quickly
+            try { await eng.unload(); } catch (e) {}
+            eng = null;
+
+            fetchingBox.remove();
+
+            // parse steps and attach UI
+            const parsed = extractReasoningAndAnswer(reasoningText);
+            const stepsOut = parsed.steps && parsed.steps.length ? parsed.steps.slice(0, ONDEMAND_STEP_LIMIT) : [parsed.answer].filter(Boolean);
+            if (stepsOut.length === 0) {
+              // nothing useful
+              appendMessage('assistant', 'No concise reasoning could be produced.');
+            } else {
+              // cache result and attach UI
+              setCachedReasoning(key, stepsOut);
+              createReasoningUI(stepsOut);
+            }
+          } catch (err) {
+            console.error('Reasoning fetch error', err);
+            if (fetchingBox && fetchingBox.parentNode) fetchingBox.textContent = 'Failed to fetch explanation.';
+            setTimeout(() => { try { if (fetchingBox && fetchingBox.parentNode) fetchingBox.remove(); } catch(e){} }, 1800);
+            try { if (eng) await eng.unload(); } catch(e){}
+            eng = null;
+          } finally {
+            explainBtn.disabled = false;
+            // keep UI smooth
+            requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+          }
+        });
+
+        chat.appendChild(explainBtn);
+      }
+
+      // make sure view scrolls smoothly
+      requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+    }
+
+    // small non-cryptographic hash for cache keys (fast)
+    function hashString(s) {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return h.toString(16);
     }
 
     // Core queue processing
@@ -343,8 +491,9 @@
       processing = true;
       while (requestQueue.length) {
         const req = requestQueue.shift();
+        // small inter-request pause to yield to UI
         await handleSingleRequest(req.userText);
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 120));
       }
       processing = false;
     }
@@ -360,18 +509,19 @@
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
         showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
+        // let browser update UI
         await new Promise(requestAnimationFrame);
       } else {
-        // ensure a frame to keep UI smooth
         await new Promise(requestAnimationFrame);
       }
 
       sendBtn.disabled = true;
+      let localEngine = null;
 
       try {
-        engine = await createEngineWithProgress();
-
-        const chunks = await engine.chat.completions.create({ messages, stream: true });
+        localEngine = await createEngineWithProgress();
+        // stream
+        const chunks = await localEngine.chat.completions.create({ messages, stream: true });
 
         let fullReply = '';
         for await (const chunk of chunks) {
@@ -384,22 +534,22 @@
             if (fullReply.length > replyCharCap) {
               fullReply = fullReply.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
               placeholder.textContent = fullReply;
-              // Attempt to break out of stream early by breaking; the stream for-await may still require cleanup
               break;
             }
-            chat.scrollTop = chat.scrollHeight;
+            // occasionally yield to UI thread to prevent jank
+            if (fullReply.length % 200 === 0) await new Promise(requestAnimationFrame);
           }
         }
 
-        // ensure full unload immediately
-        try { await engine.unload(); } catch(e) {}
-        engine = null;
+        // unload model immediately
+        try { await localEngine.unload(); } catch(e) {}
+        localEngine = null;
 
         // remove placeholder and render structured assistant reply
         placeholder.remove();
-        renderAssistantReply(fullReply);
+        renderAssistantReply(fullReply, userText);
 
-        // persist history externally
+        // persist history externally (kept minimal)
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
         const maxEntries = (lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL) * 2;
         if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
@@ -410,8 +560,8 @@
         console.error('Inference error', err);
         placeholder.remove();
         appendMessage('assistant', 'I had a memory spike or connection error. Try again in a moment.');
-        try { if (engine) await engine.unload(); } catch(e){}
-        engine = null;
+        try { if (localEngine) await localEngine.unload(); } catch(e){}
+        localEngine = null;
         hideOverlay();
       } finally {
         sendBtn.disabled = false;
@@ -427,13 +577,13 @@
     }
 
     // UI wiring
-    document.getElementById('send').addEventListener('click', () => {
+    sendBtn.addEventListener('click', () => {
       const txt = userInput.value.trim();
       if (!txt) return;
       userInput.value = '';
       queueRequest(txt);
     });
-    userInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('send').click(); } });
+    userInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendBtn.click(); } });
 
     // Reset
     resetBtn.addEventListener('click', async () => {
@@ -517,10 +667,10 @@
     cancelTraitsBtn.addEventListener('click', () => closeTraits());
     traitsBtn.addEventListener('click', () => openTraits());
 
-    // initial load
+    // initial load: use small default trait set for low memory
     userTraits = loadTraits();
     if (!userTraits || !userTraits.length) {
-      userTraits = ['Concise','Numbered steps','English'];
+      userTraits = ['Concise','English'];
       saveTraits(userTraits);
     }
     lowPower = loadLowPower();
