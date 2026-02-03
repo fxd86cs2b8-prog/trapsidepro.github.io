@@ -140,6 +140,7 @@
     const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1';
     const REASONING_CACHE_KEY = 'qwen_reasoning_cache_v1';
     const MAX_MESSAGES_IN_DOM = 10;      // keep DOM light
+    const RECOVERY_MAX_RETRIES = 1;      // avoid repeated recovery calls
 
     // UI refs
     const chat = document.getElementById('chat');
@@ -171,6 +172,9 @@
     let engine = null; // keep for potential unload in reset
     const requestQueue = [];
     let processing = false;
+
+    // small per-request recovery counter
+    let recoveryAttempts = 0;
 
     // persistence helpers
     function loadTraits(){ try { const r = localStorage.getItem(TRAITS_KEY); return r ? JSON.parse(r).slice(0,MAX_TRAITS) : []; } catch { return []; } }
@@ -208,18 +212,14 @@
 
     // helpers
     function appendMessage(role, text){
-      // limit DOM message growth: remove the oldest if too many
-      if (chat.children.length >= MAX_MESSAGES_IN_DOM) {
-        // remove second child (keep header or initial?) but simpler: remove chat.firstChild until under limit
-        while (chat.children.length >= MAX_MESSAGES_IN_DOM) {
-          chat.removeChild(chat.firstChild);
-        }
+      // limit DOM message growth: remove the oldest while keeping within limit
+      while (chat.children.length >= MAX_MESSAGES_IN_DOM) {
+        chat.removeChild(chat.firstChild);
       }
       const d = document.createElement('div');
       d.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
       d.textContent = text;
       chat.appendChild(d);
-      // small delay to allow DOM update before scroll to avoid jank
       requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
       return d;
     }
@@ -234,7 +234,6 @@
     let lastOverlayProgress = -1;
     function showOverlay(title='Preparing model…', sub='Optimizing for low-memory', progress=0){
       const p = Math.max(0, Math.min(1, progress));
-      // update only if change >= 2% to avoid frequent writes
       if (Math.abs(p - lastOverlayProgress) < 0.02 && overlay.style.display === 'flex') {
         overlayTitle.textContent = title;
         overlaySub.textContent = sub;
@@ -254,7 +253,6 @@
       const alreadyDownloaded = modelDownloadedFlag();
       let downloadObserved = false;
 
-      // keep a local reference during creation so we can unload on errors
       const eng = await webllm.CreateMLCEngine(MODEL_ID, {
         initProgressCallback: (report) => {
           const p = Math.max(0, Math.min(1, (report && report.progress) || 0));
@@ -263,14 +261,12 @@
           if (!alreadyDownloaded) {
             if (p < 1) {
               downloadObserved = true;
-              // show overlay throttled
               showOverlay(text || 'Downloading model…', 'This happens only once on this device', p);
             } else {
               if (downloadObserved) setModelDownloadedFlag();
               hideOverlay();
             }
           }
-          // if already downloaded, suppress overlay for smoothness
         }
       });
 
@@ -278,20 +274,18 @@
     }
 
     // build compact system prompt that includes probabilistic reasoning + CoT policy
+    // IMPORTANT: require Answer: first then optional steps then Certainty:. This reduces certainty-only replies.
     function buildSystemPrompt(){
-      // compact trait line
       const traits = lowPower ? userTraits.slice(0, LOWPOWER_TRAITS) : userTraits.slice(0, MAX_TRAITS);
       const compact = traits.map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).join(' | ');
-      // Probabilistic reasoning guidance (short)
-      const prob = "Treat outputs as probabilistic predictions; avoid overconfidence. Provide a short certainty tag: [High|Medium|Low].";
-      // Chain-of-Thought guidance (brief and constrained)
+      const prob = "Treat outputs as probabilistic predictions; avoid overconfidence. Always include the final answer prefixed with 'Answer:' (single-line). Optionally append 'Certainty: [High|Medium|Low]' after the answer.";
       let cotInstr = "";
       if (cotEnabled && !lowPower) {
-        cotInstr = "When enabled, produce up to 3 concise numbered reasoning steps, then a single-line final answer labeled 'Answer:'. End with 'Certainty: [High|Medium|Low]'. Keep steps short.";
+        cotInstr = "When enabled, you may include up to 3 concise numbered reasoning steps BEFORE the final 'Answer:'. Keep steps short.";
       } else if (cotEnabled && lowPower) {
-        cotInstr = "CoT is enabled but device is in Low Power: provide a single concise step, then 'Answer:' and 'Certainty:'.";
+        cotInstr = "CoT is enabled but device is in Low Power: provide a single concise step before 'Answer:'.";
       } else {
-        cotInstr = "Do not expose internal chain-of-thought; provide a concise direct answer and a short certainty tag.";
+        cotInstr = "Do not expose internal chain-of-thought; provide a concise direct answer (use 'Answer:'), and optionally a short 'Certainty:' tag.";
       }
 
       const base = lowPower ? "Concise assistant. Keep replies extremely short." : "Concise assistant. Keep replies short.";
@@ -315,32 +309,38 @@
       if (answerMatch) {
         const answer = answerMatch[1].trim();
         const reasoningPart = fullText.slice(0, answerMatch.index).trim();
-        // Try to split reasoning into lines/steps
         const steps = reasoningPart ? reasoningPart.split(/\r?\n/).map(s => s.trim()).filter(Boolean) : [];
         return { steps, answer };
       }
-      // fallback: try to detect "Certainty:" suffix and split before it
+      // fallback: try to detect "Certainty:" suffix
       const certMatch = fullText.match(/(.*)\nCertainty\s*:\s*(High|Medium|Low)/i);
       if (certMatch) {
         const reasoningAndAnswer = certMatch[1].trim();
         return { steps: [], answer: reasoningAndAnswer };
       }
-      // if nothing matched, return whole as answer without steps
       return { steps: [], answer: fullText.trim() };
     }
 
+    // small helper to detect certainty-only or trivial outputs
+    function isCertaintyOnly(text) {
+      if (!text) return true;
+      const t = text.trim();
+      // single words like High, Medium, Low (case-insensitive)
+      if (/^(high|medium|low)$/i.test(t)) return true;
+      // single-letter responses or extremely short fragments
+      if (t.length <= 3 && /^[A-Za-z]{1,3}$/.test(t)) return true;
+      return false;
+    }
+
     // UI: render assistant reply with optional on-demand reasoning button
-    // note: userText should be passed so explain requests can reference original question
     function renderAssistantReply(fullReply, userText) {
       const { steps, answer } = extractReasoningAndAnswer(fullReply);
 
-      // assistant message container
       const assistantDiv = document.createElement('div');
       assistantDiv.className = 'msg assistant';
       assistantDiv.textContent = answer || fullReply || '…';
       chat.appendChild(assistantDiv);
 
-      // helper to create collapsed reasoning UI
       function createReasoningUI(stepsArr) {
         const wrapper = document.createElement('div');
         wrapper.style.display = 'flex';
@@ -358,7 +358,7 @@
         const reasoningBox = document.createElement('div');
         reasoningBox.className = 'reasoning';
         reasoningBox.style.display = 'none';
-        // render steps
+
         stepsArr.forEach((s) => {
           const stepEl = document.createElement('div');
           stepEl.className = 'step';
@@ -378,10 +378,8 @@
       }
 
       if (steps && steps.length > 0) {
-        // model already provided steps — show collapsed block
         createReasoningUI(steps);
       } else {
-        // no reasoning present in reply -> provide "Explain" button (on-demand micro-CoT)
         const explainBtn = document.createElement('button');
         explainBtn.className = 'btn';
         explainBtn.textContent = 'Explain';
@@ -391,7 +389,6 @@
 
         explainBtn.addEventListener('click', async () => {
           explainBtn.disabled = true;
-          // compute cache key based on question + answer snippet
           const key = `k:${hashString((userText || '') + '||' + (answer || fullReply || ''))}`;
           const cached = getCachedReasoning(key);
           if (cached) {
@@ -400,16 +397,11 @@
             return;
           }
 
-          // small char cap for on-demand reasoning to preserve performance
-          const ONDEMAND_STEP_LIMIT = lowPower ? 1 : 2; // 1 step in low power, else 2
+          const ONDEMAND_STEP_LIMIT = lowPower ? 1 : 2;
           const perStepChar = 120;
-
-          // build strict system instruction for micro-CoT
           const sys = clampString(`Produce up to ${ONDEMAND_STEP_LIMIT} concise numbered reasoning steps (each <= ${perStepChar} chars). Then a single-line 'Answer:' and 'Certainty: [High|Medium|Low]'. No extra commentary.`, 380);
-
           const prompt = `Question: ${userText || '[unknown]'}\nAnswer: ${answer || fullReply || '[unknown]'}\nProvide only the concise reasoning steps and final Answer/Certainty.`;
 
-          // small placeholder while fetching
           const fetchingBox = document.createElement('div');
           fetchingBox.className = 'reasoning';
           fetchingBox.style.display = 'block';
@@ -420,38 +412,29 @@
           let eng = null;
           try {
             eng = await createEngineWithProgress();
-            // create small messages
             const messages = [{ role: 'system', content: sys }, { role: 'user', content: prompt }];
-
-            // stream and collect until cap or complete
             const chunks = await eng.chat.completions.create({ messages, stream: true });
             let reasoningText = '';
             for await (const chunk of chunks) {
               const delta = chunk?.choices?.[0]?.delta?.content || '';
               if (delta) {
                 reasoningText += delta;
-                // limit to ONDEMAND_CHAR_CAP to avoid runaway
                 if (reasoningText.length > ONDEMAND_CHAR_CAP) {
                   reasoningText = reasoningText.slice(0, ONDEMAND_CHAR_CAP) + '\n\n[truncated]';
                   break;
                 }
               }
             }
-
-            // unload quickly
             try { await eng.unload(); } catch (e) {}
             eng = null;
 
             fetchingBox.remove();
 
-            // parse steps and attach UI
             const parsed = extractReasoningAndAnswer(reasoningText);
             const stepsOut = parsed.steps && parsed.steps.length ? parsed.steps.slice(0, ONDEMAND_STEP_LIMIT) : [parsed.answer].filter(Boolean);
             if (stepsOut.length === 0) {
-              // nothing useful
               appendMessage('assistant', 'No concise reasoning could be produced.');
             } else {
-              // cache result and attach UI
               setCachedReasoning(key, stepsOut);
               createReasoningUI(stepsOut);
             }
@@ -463,7 +446,6 @@
             eng = null;
           } finally {
             explainBtn.disabled = false;
-            // keep UI smooth
             requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
           }
         });
@@ -471,7 +453,6 @@
         chat.appendChild(explainBtn);
       }
 
-      // make sure view scrolls smoothly
       requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
     }
 
@@ -491,25 +472,49 @@
       processing = true;
       while (requestQueue.length) {
         const req = requestQueue.shift();
-        // small inter-request pause to yield to UI
         await handleSingleRequest(req.userText);
         await new Promise(resolve => setTimeout(resolve, 120));
       }
       processing = false;
     }
 
+    // Recovery helper — ask a strict single-line answer if the first reply was only a certainty
+    async function recoveryDirectAnswer(userText) {
+      try {
+        const eng = await createEngineWithProgress();
+        const sys = "Concise assistant. Provide a single-line direct answer to the user's question. Do NOT include 'Certainty' or steps — just the answer.";
+        const messages = [{ role: 'system', content: sys }, { role: 'user', content: userText }];
+        const chunks = await eng.chat.completions.create({ messages, stream: true });
+        let text = '';
+        for await (const chunk of chunks) {
+          const delta = chunk?.choices?.[0]?.delta?.content || '';
+          if (delta) {
+            text += delta;
+            if (text.length > (lowPower ? REPLY_CHAR_CAP_LOW : REPLY_CHAR_CAP_NORMAL)) {
+              text = text.slice(0, lowPower ? REPLY_CHAR_CAP_LOW : REPLY_CHAR_CAP_NORMAL) + '\n\n[truncated]';
+              break;
+            }
+          }
+        }
+        try { await eng.unload(); } catch(e) {}
+        return text.trim();
+      } catch (err) {
+        console.error('Recovery fetch failed', err);
+        return null;
+      }
+    }
+
     // Handle single request implementing Method 4 and CoT constraints
     async function handleSingleRequest(userText) {
+      recoveryAttempts = 0;
       const replyCharCap = lowPower ? REPLY_CHAR_CAP_LOW : REPLY_CHAR_CAP_NORMAL;
       const messages = buildMessages(userText);
 
-      // placeholder assistant node (we'll remove + replace after streaming completes)
       const placeholder = appendMessage('assistant', '…');
 
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
         showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
-        // let browser update UI
         await new Promise(requestAnimationFrame);
       } else {
         await new Promise(requestAnimationFrame);
@@ -520,7 +525,6 @@
 
       try {
         localEngine = await createEngineWithProgress();
-        // stream
         const chunks = await localEngine.chat.completions.create({ messages, stream: true });
 
         let fullReply = '';
@@ -528,28 +532,40 @@
           const delta = chunk?.choices?.[0]?.delta?.content || '';
           if (delta) {
             fullReply += delta;
-            // Show streaming text in placeholder so user sees progress
             placeholder.textContent = fullReply;
-            // enforce cap to avoid runaway
             if (fullReply.length > replyCharCap) {
               fullReply = fullReply.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
               placeholder.textContent = fullReply;
               break;
             }
-            // occasionally yield to UI thread to prevent jank
             if (fullReply.length % 200 === 0) await new Promise(requestAnimationFrame);
           }
         }
 
-        // unload model immediately
         try { await localEngine.unload(); } catch(e) {}
         localEngine = null;
 
-        // remove placeholder and render structured assistant reply
+        // if the model returned only a certainty or an extremely short fragment, try a quick recovery call once
+        if (isCertaintyOnly(fullReply) && recoveryAttempts < RECOVERY_MAX_RETRIES) {
+          recoveryAttempts++;
+          placeholder.textContent = '[received tag only — fetching concise answer…]';
+          const recovered = await recoveryDirectAnswer(userText);
+          if (recovered) {
+            placeholder.remove();
+            renderAssistantReply(recovered, userText);
+            history.push({ role: 'user', content: userText }, { role: 'assistant', content: recovered });
+            const maxEntries = (lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL) * 2;
+            if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
+            if (maxEntries === 0) history = [];
+            hideOverlay();
+            return;
+          }
+          // if recovery failed, fall back to showing the original (certainty) reply below
+        }
+
         placeholder.remove();
         renderAssistantReply(fullReply, userText);
 
-        // persist history externally (kept minimal)
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
         const maxEntries = (lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL) * 2;
         if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
@@ -592,7 +608,6 @@
       requestQueue.length = 0;
       try { if (engine) await engine.unload(); } catch(e) {}
       engine = null;
-      // Do not clear model downloaded flag so overlay won't reappear
     });
 
     // Low-power toggle wiring
@@ -601,7 +616,6 @@
     lowPowerToggle.addEventListener('change', (e) => {
       lowPower = !!e.target.checked;
       saveLowPower(lowPower);
-      // if lowPower enabled, disable CoT to preserve memory (and sync toggle)
       if (lowPower && cotEnabled) {
         cotEnabled = false;
         cotToggle.checked = false;
@@ -615,11 +629,9 @@
     // CoT toggle wiring
     cotEnabled = loadCoT();
     cotToggle.checked = cotEnabled;
-    // if lowPower true, force cotDisabled
     if (lowPower && cotEnabled) { cotEnabled = false; cotToggle.checked = false; saveCoT(false); }
     cotToggle.addEventListener('change', (e) => {
       const requested = !!e.target.checked;
-      // disallow enabling CoT when lowPower is ON
       if (lowPower && requested) {
         cotToggle.checked = false;
         cotEnabled = false;
@@ -675,7 +687,6 @@
     }
     lowPower = loadLowPower();
     cotEnabled = loadCoT();
-    // ensure CoT disabled while in Low Power
     if (lowPower && cotEnabled) { cotEnabled = false; cotToggle.checked = false; saveCoT(false); }
 
     // focus input
