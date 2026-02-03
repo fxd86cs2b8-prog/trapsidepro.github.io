@@ -21,8 +21,8 @@
       --glass: rgba(255,255,255,0.78);
     }
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(160deg,var(--bg1),var(--bg2));-webkit-font-smoothing:antialiased}
-    .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-shadow:0 8px 30px rgba(21,28,40,0.08)}
-    header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.04);background:linear-gradient(180deg, rgba(255,255,255,0.95), transparent)}
+    .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-sh[...]
+    header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.04);background:linear-gradient(180deg, rgba(255,255,255,0.95), transpare[...]
     .title{font-weight:700;color:#0b1220}
     .controls{display:flex;gap:8px;align-items:center}
     .btn{background:transparent;border:1px solid rgba(0,0,0,0.06);padding:6px 10px;border-radius:12px;font-size:13px;cursor:pointer;box-shadow:0 1px 0 rgba(255,255,255,0.6)}
@@ -292,8 +292,7 @@
         // Boot engine; createEngineWithProgress will itself decide whether to display progress overlay
         engine = await createEngineWithProgress();
 
-        // If overlay was suppressed because model previously downloaded, createEngineWithProgress will not show it.
-        // Continue to inference
+        // First pass: generate initial answer (stream)
         const chunks = await engine.chat.completions.create({ messages, stream: true });
 
         let fullReply = '';
@@ -308,6 +307,53 @@
             }
             aiNode.textContent = fullReply;
             chat.scrollTop = chat.scrollHeight;
+          }
+        }
+
+        // Thinking / refine pass (only in normal mode)
+        if (!lowPower) {
+          // show a small refining placeholder
+          const refiningNode = appendMessage('assistant', 'Refining answer…');
+
+          // Build refine messages:
+          // system prompt + (recent history including the user message) + assistant's initial reply as context +
+          // then ask the model to improve that assistant reply.
+          const system = buildSystemPrompt();
+          // messages currently = [system, ...recent, {user: userText}]
+          // We'll reuse recent and the user turn from messages (slice off system)
+          const reusedTurns = messages.slice(1);
+          const refineInstruction = 'Please improve the assistant response above: fix any mistakes, make it clearer and more helpful, and add any brief missing details. Return only the improved answer.';
+          const refineMessages = [{ role: 'system', content: system }, ...reusedTurns, { role: 'assistant', content: fullReply }, { role: 'user', content: refineInstruction }];
+
+          try {
+            const refineChunks = await engine.chat.completions.create({ messages: refineMessages, stream: true });
+            let refined = '';
+            for await (const chunk of refineChunks) {
+              const delta = chunk?.choices?.[0]?.delta?.content || '';
+              if (delta) {
+                refined += delta;
+                if (refined.length > replyCharCap) {
+                  refined = refined.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
+                  refiningNode.textContent = refined;
+                  break;
+                }
+                refiningNode.textContent = refined;
+                chat.scrollTop = chat.scrollHeight;
+              }
+            }
+
+            // Use refined if available, otherwise keep first reply
+            if (refined.trim()) {
+              aiNode.textContent = refined;
+              fullReply = refined;
+            }
+          } catch (e) {
+            // If refine fails, keep the original and add a small note
+            console.error('Refine pass error', e);
+            appendMessage('assistant', 'Refinement failed; returning initial answer.');
+          } finally {
+            // remove the temporary refining placeholder if present
+            try { refiningNode.remove(); } catch {}
           }
         }
 
