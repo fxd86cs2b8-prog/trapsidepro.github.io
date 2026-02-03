@@ -21,8 +21,8 @@
       --glass: rgba(255,255,255,0.78);
     }
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(160deg,var(--bg1),var(--bg2));-webkit-font-smoothing:antialiased}
-    .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-sh[...]
-    header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.04);background:linear-gradient(180deg, rgba(255,255,255,0.95), transpare[...]
+    .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-shadow:0 10px 30px rgba(11,17,24,0.06)}
+    header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(0,0,0,0.04);background:linear-gradient(180deg, rgba(255,255,255,0.95), transparent)}
     .title{font-weight:700;color:#0b1220}
     .controls{display:flex;gap:8px;align-items:center}
     .btn{background:transparent;border:1px solid rgba(0,0,0,0.06);padding:6px 10px;border-radius:12px;font-size:13px;cursor:pointer;box-shadow:0 1px 0 rgba(255,255,255,0.6)}
@@ -130,7 +130,11 @@
     const SYSTEM_PROMPT_CHAR_CAP = 420;  // maximum chars for system prompt to avoid large starts
     const TRAITS_KEY = 'qwen_user_traits_v1';
     const LOWPOWER_KEY = 'qwen_lowpower_v1';
-    const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1'; // new: remember first-time download
+    const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1'; // remember first-time download
+
+    // REFINE_DELAY_MS controls how long the assistant "rests/thinks" before doing the refine pass.
+    // Set to 10000 (10s) by default. Change to 20000 for 20s if you prefer a longer pause.
+    const REFINE_DELAY_MS = 10000;
 
     // UI refs
     const chat = document.getElementById('chat');
@@ -200,7 +204,7 @@
     // Engine create with progress callback
     async function createEngineWithProgress() {
       // Decide whether we should show overlay for this run:
-      // Only show when model has never been downloaded (first-time). If the MODEL_DOWNLOADED_KEY exists, suppress overlay.
+      // Only show when model has never been downloaded (first-time).
       const alreadyDownloaded = modelDownloadedFlag();
       let downloadObserved = false; // did we observe any progress < 1 (actual download) this run?
 
@@ -210,22 +214,17 @@
           const text = (report && report.text) || '';
 
           if (!alreadyDownloaded) {
-            // Only show the overlay if we haven't seen a prior complete download marker.
-            // Show during progress phases (p < 1). When p >= 1, if we observed p<1 earlier, mark as downloaded.
             if (p < 1) {
               downloadObserved = true;
               showOverlay(text || 'Downloading model…', 'This happens only once on this device', p);
             } else {
-              // progress reached completion
               if (downloadObserved) {
-                // This run performed a real download — remember so next boots won't show overlay
                 setModelDownloadedFlag();
               }
               hideOverlay();
             }
           } else {
-            // already downloaded on this device — do nothing (suppress overlay entirely)
-            // (We intentionally do not call showOverlay here)
+            // already downloaded on this device — do nothing (suppress overlay)
           }
         }
       });
@@ -266,23 +265,20 @@
       processing = false;
     }
 
-    // Handle a single user request (entire Method 4 lifecycle)
+    // Handle a single user request (entire lifecycle with optional refine pass)
     async function handleSingleRequest(userText){
       const replyCharCap = lowPower ? REPLY_CHAR_CAP_LOW : REPLY_CHAR_CAP_NORMAL;
       const messages = buildMessages(userText);
 
-      // Optimistically append placeholders to the UI (we already did for the queued call)
+      // Optimistically append user + assistant placeholders
       const aiNode = appendMessage('assistant','…');
 
       // Pre-render overlay to avoid freeze, but only if it's the real first-time download.
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
-        // show a title while we prepare for the download (only visible on first-time)
         showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
-        // ensure the DOM paints
         await new Promise(requestAnimationFrame);
       } else {
-        // Do not show overlay; still yield a frame for smoothness
         await new Promise(requestAnimationFrame);
       }
 
@@ -292,7 +288,7 @@
         // Boot engine; createEngineWithProgress will itself decide whether to display progress overlay
         engine = await createEngineWithProgress();
 
-        // First pass: generate initial answer (stream)
+        // First pass: generate initial answer (stream and render progressively)
         const chunks = await engine.chat.completions.create({ messages, stream: true });
 
         let fullReply = '';
@@ -310,22 +306,31 @@
           }
         }
 
-        // Thinking / refine pass (only in normal mode)
+        // Refine pass (ONLY in normal mode). The UI should not show the internal refine stream.
         if (!lowPower) {
-          // show a small refining placeholder
-          const refiningNode = appendMessage('assistant', 'Refining answer…');
+          // Wait (rest/thinking) before refine to simulate "thinking". User wanted 10s or 20s; default is REFINE_DELAY_MS.
+          await new Promise(resolve => setTimeout(resolve, REFINE_DELAY_MS));
+
+          // Indicate thinking to the user but hide internal steps.
+          aiNode.textContent = 'Thinking…';
+          chat.scrollTop = chat.scrollHeight;
 
           // Build refine messages:
-          // system prompt + (recent history including the user message) + assistant's initial reply as context +
-          // then ask the model to improve that assistant reply.
+          // system prompt + recent context + assistant's initial reply as context + instruction to improve
           const system = buildSystemPrompt();
-          // messages currently = [system, ...recent, {user: userText}]
-          // We'll reuse recent and the user turn from messages (slice off system)
-          const reusedTurns = messages.slice(1);
-          const refineInstruction = 'Please improve the assistant response above: fix any mistakes, make it clearer and more helpful, and add any brief missing details. Return only the improved answer.';
+          const reusedTurns = messages.slice(1); // recent turns and user turn
+          const refineInstruction = `
+Please improve the assistant response above. Do not include internal deliberation or step-by-step chain-of-thought.
+- Fix any factual or language errors.
+- Make the answer clearer and more helpful.
+- Add brief, concrete missing details if useful.
+- Keep the response concise and user-facing; return only the improved final answer.
+`.trim();
+
           const refineMessages = [{ role: 'system', content: system }, ...reusedTurns, { role: 'assistant', content: fullReply }, { role: 'user', content: refineInstruction }];
 
           try {
+            // We stream the refine result but DO NOT update the UI until the final refined text is complete.
             const refineChunks = await engine.chat.completions.create({ messages: refineMessages, stream: true });
             let refined = '';
             for await (const chunk of refineChunks) {
@@ -334,34 +339,32 @@
                 refined += delta;
                 if (refined.length > replyCharCap) {
                   refined = refined.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
-                  refiningNode.textContent = refined;
                   break;
                 }
-                refiningNode.textContent = refined;
-                chat.scrollTop = chat.scrollHeight;
+                // intentionally do not update aiNode here to hide internal progress
               }
             }
 
-            // Use refined if available, otherwise keep first reply
-            if (refined.trim()) {
+            // If we got a non-empty refined answer, replace the placeholder with it.
+            if (refined && refined.trim()) {
               aiNode.textContent = refined;
               fullReply = refined;
+            } else {
+              // If refine returned nothing useful, revert to the original answer (already overwritten by 'Thinking…')
+              aiNode.textContent = fullReply || 'Sorry, I could not generate an answer.';
             }
           } catch (e) {
-            // If refine fails, keep the original and add a small note
             console.error('Refine pass error', e);
-            appendMessage('assistant', 'Refinement failed; returning initial answer.');
-          } finally {
-            // remove the temporary refining placeholder if present
-            try { refiningNode.remove(); } catch {}
+            // On refine failure, restore the initial answer with a small note
+            aiNode.textContent = fullReply + '\n\n[refinement failed]';
           }
         }
 
-        // Immediate purge
+        // Immediate purge to free memory
         try { await engine.unload(); } catch(e) { /* ignore */ }
         engine = null;
 
-        // Persist externally and clamp history
+        // Persist history and clamp
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
         const maxEntries = (lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL) * 2;
         if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
@@ -371,7 +374,6 @@
       } catch (err) {
         console.error('Inference error', err);
         appendMessage('assistant','I had a memory spike or connection error. Try again in a moment.');
-        // Best-effort cleanup
         try { if(engine) await engine.unload(); } catch(e){}
         engine = null;
         hideOverlay();
@@ -382,12 +384,9 @@
 
     // Enqueue a user request (ensures single-run)
     function queueRequest(userText){
-      // Prevent blank messages
       if(!userText || !userText.trim()) return;
-      // immediate UI feedback (append user message)
       appendMessage('user', userText);
       requestQueue.push({ userText });
-      // start processing if not already
       processQueue();
     }
 
@@ -404,12 +403,10 @@
     resetBtn.addEventListener('click', async () => {
       history = [];
       chat.innerHTML = '<div class="msg assistant">Memory purged. Ready.</div>';
-      // clear queue
       requestQueue.length = 0;
-      // try unload
       try { if(engine) await engine.unload(); } catch {}
       engine = null;
-      // Note: do NOT clear the downloaded flag so users don't see the download overlay again.
+      // keep downloaded flag so overlay won't reappear
     });
 
     // Low power toggle
@@ -418,14 +415,11 @@
     lowPowerToggle.addEventListener('change', (e) => {
       lowPower = !!e.target.checked;
       saveLowPower(lowPower);
-      // brief non-blocking toast via overlay only if first-time model download hasn't happened
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
         showOverlay(lowPower ? 'Low Power: ON' : 'Low Power: OFF', lowPower ? 'Context is minimized' : 'Normal mode', 0.25);
         setTimeout(()=>hideOverlay(), 700);
       } else {
-        // if model already downloaded, do minimal visual feedback (no overlay)
-        // flash a small ephemeral assistant message
         appendMessage('assistant', lowPower ? 'Low Power enabled — context minimized.' : 'Low Power disabled — normal mode.');
       }
     });
@@ -461,11 +455,9 @@
       renderTraitsModal();
     });
     saveTraitsBtn.addEventListener('click', () => {
-      // sanitize
       userTraits = userTraits.map(s => (s || '').trim()).filter(Boolean).slice(0, MAX_TRAITS);
       saveTraits(userTraits);
       closeTraits();
-      // feedback (no overlay if model already downloaded)
       if (!modelDownloadedFlag()) {
         showOverlay('Traits saved','They will be included on next boot if needed',0.3);
         setTimeout(()=>hideOverlay(),600);
