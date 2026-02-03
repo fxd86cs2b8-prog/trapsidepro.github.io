@@ -36,7 +36,6 @@
     button#send{background:linear-gradient(90deg,var(--primary),var(--accent));color:#fff;border:none;padding:10px 14px;border-radius:14px;cursor:pointer;box-shadow:0 6px 18px rgba(0,122,255,0.12)}
     button:disabled{opacity:0.5;cursor:not-allowed}
 
-    /* overlay + modal (first-time only) */
     .overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(8,12,20,0.12);z-index:60;padding:20px}
     .progressModal{width:88%;max-width:420px;background:var(--card);border-radius:12px;padding:14px;text-align:center;box-shadow:0 12px 40px rgba(6,10,18,0.12)}
     .progressBar{height:8px;background:#eee;border-radius:8px;overflow:hidden;margin-top:12px}
@@ -73,19 +72,17 @@
     <header>
       <div class="title">Qwen Air Pro</div>
       <div class="controls">
-        <!-- Low Power toggle (kept, default ON) -->
         <label class="toggle" title="Low Power Mode">
           <input id="lowPowerToggle" type="checkbox" />
         </label>
 
+        <button class="btn" id="testModelBtn">Test model</button>
         <button class="btn" id="traitsBtn">Traits</button>
         <button class="btn btn--danger" id="resetBtn">Reset</button>
       </div>
     </header>
 
-    <main id="chat" aria-live="polite" aria-atomic="false">
-      <!-- content filled by script -->
-    </main>
+    <main id="chat" aria-live="polite" aria-atomic="false"></main>
 
     <div class="input-row">
       <input id="userInput" type="text" placeholder="Ask me anything..." autocomplete="off" />
@@ -93,46 +90,24 @@
     </div>
   </div>
 
-  <!-- Traits Editor Overlay -->
-  <div class="overlay" id="traitsOverlay" aria-hidden="true">
-    <div class="traitsModal" role="dialog" aria-modal="true" aria-labelledby="traitsTitle">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <div id="traitsTitle" style="font-weight:700">User Traits (max 7)</div>
-        <div class="muted" id="traitsCount">0/7</div>
-      </div>
-
-      <div class="trait-chips" id="traitsChips" aria-hidden="false"></div>
-
-      <div class="traitsEditor" id="traitsEditor"></div>
-
-      <div class="modalActions">
-        <button class="btn" id="addTraitBtn">+ Add</button>
-        <button class="btn" id="saveTraitsBtn">Save</button>
-        <button class="btn" id="cancelTraitsBtn">Cancel</button>
-      </div>
-
-      <div class="muted" style="margin-top:8px">Low Power mode injects fewer traits and limits history to reduce memory use.</div>
-    </div>
-  </div>
-
   <script type="module">
     import * as webllm from "@mlc-ai/web-llm";
 
-    // Models: default and small model for low-power
+    // Model IDs
     const DEFAULT_MODEL_ID = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC";
-    const SMALL_MODEL_ID = "SmolLM2-360M"; // using the requested SmolLM2-360M when in low power
+    const SMALL_MODEL_ID = "SmolLM2-360M-Instruct-q4f16_1-MLC"; // updated to the exact ID you provided
 
-    // Config and caps (tuned for low-RAM devices)
+    // Config
     const MAX_TRAITS = 7;
     const LOWPOWER_TRAITS = 2;
     const HISTORY_TURNS_LOW = 0;
-    let REPLY_CHAR_CAP_LOW = 500;   // overridden for very-low-memory devices
+    let REPLY_CHAR_CAP_LOW = 500;
     const SYSTEM_PROMPT_CHAR_CAP = 420;
     const TRAITS_KEY = 'qwen_user_traits_v1';
     const LOWPOWER_KEY = 'qwen_lowpower_v1';
     const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1';
     const REASONING_CACHE_KEY = 'qwen_reasoning_cache_v1';
-    let MAX_MESSAGES_IN_DOM = 6;    // may be lowered for very-low-memory devices
+    let MAX_MESSAGES_IN_DOM = 6;
     const ALL_MESSAGES_STORE_CAP = 300;
     const MAX_RESET_RETRIES = 2;
 
@@ -141,21 +116,13 @@
     const userInput = document.getElementById('userInput');
     const sendBtn = document.getElementById('send');
     const resetBtn = document.getElementById('resetBtn');
+    const testModelBtn = document.getElementById('testModelBtn');
     const overlay = document.getElementById('overlay');
     const overlayTitle = document.getElementById('overlayTitle');
     const overlaySub = document.getElementById('overlaySub');
     const overlayBar = document.getElementById('overlayBar');
     const lowPowerToggle = document.getElementById('lowPowerToggle');
     const traitsBtn = document.getElementById('traitsBtn');
-
-    // modal refs
-    const traitsOverlay = document.getElementById('traitsOverlay');
-    const traitsEditor = document.getElementById('traitsEditor');
-    const traitsChips = document.getElementById('traitsChips');
-    const addTraitBtn = document.getElementById('addTraitBtn');
-    const saveTraitsBtn = document.getElementById('saveTraitsBtn');
-    const cancelTraitsBtn = document.getElementById('cancelTraitsBtn');
-    const traitsCount = document.getElementById('traitsCount');
 
     // state
     let userTraits = [];
@@ -164,18 +131,61 @@
     function saveLowPower(v){ try { localStorage.setItem(LOWPOWER_KEY, v ? '1' : '0'); } catch {} }
 
     let lowPower = true;
-    let history = [];
     let engine = null;
-    const requestQueue = [];
-    let processing = false;
-
-    // windowed message rendering (keeps DOM small but allows viewing full convo)
     const allMessages = [];
     let displayStart = 0;
     let MESSAGE_WINDOW = MAX_MESSAGES_IN_DOM;
     let userIsNearBottom = true;
+    const requestQueue = [];
+    let processing = false;
 
-    // Device detection for low-memory devices and iPhone heuristics
+    // small helpers
+    function appendMessage(role, text, opts = {}) {
+      allMessages.push({ role, text, className: opts.className || '' });
+      if (allMessages.length > ALL_MESSAGES_STORE_CAP) allMessages.shift();
+      // keep window anchored to tail by default
+      displayStart = Math.max(0, allMessages.length - MESSAGE_WINDOW);
+      renderMessageWindow();
+    }
+    function renderMessageWindow() {
+      chat.innerHTML = '';
+      // load earlier button
+      if (displayStart > 0) {
+        const loadBtn = document.createElement('button');
+        loadBtn.className = 'btn';
+        loadBtn.textContent = 'Load earlier';
+        loadBtn.addEventListener('click', () => {
+          displayStart = Math.max(0, displayStart - MESSAGE_WINDOW);
+          renderMessageWindow();
+          requestAnimationFrame(() => { chat.scrollTop = 1; });
+        });
+        const w = document.createElement('div'); w.style.display='flex'; w.style.justifyContent='center'; w.appendChild(loadBtn); chat.appendChild(w);
+      }
+      const end = Math.min(allMessages.length, displayStart + MESSAGE_WINDOW);
+      for (let i = displayStart; i < end; i++) {
+        const m = allMessages[i];
+        const d = document.createElement('div');
+        d.className = (m.className ? m.className + ' ' : '') + 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        d.textContent = m.text;
+        chat.appendChild(d);
+      }
+      // load newer
+      if ((displayStart + MESSAGE_WINDOW) < allMessages.length) {
+        const newerBtn = document.createElement('button');
+        newerBtn.className = 'btn';
+        newerBtn.textContent = 'Load newer';
+        newerBtn.addEventListener('click', () => {
+          const maxStart = Math.max(0, allMessages.length - MESSAGE_WINDOW);
+          displayStart = Math.min(maxStart, displayStart + MESSAGE_WINDOW);
+          renderMessageWindow();
+          requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+        });
+        const w2 = document.createElement('div'); w2.style.display='flex'; w2.style.justifyContent='center'; w2.appendChild(newerBtn); chat.appendChild(w2);
+      }
+      if (userIsNearBottom) requestAnimationFrame(()=>{chat.scrollTop = chat.scrollHeight;});
+    }
+
+    // device heuristic: tighten caps if very low memory
     function isVeryLowMemoryDevice() {
       try {
         const dm = navigator.deviceMemory || 0;
@@ -183,16 +193,9 @@
         const isIphone = /iphone/i.test(ua);
         if (dm && dm <= 1.5) return true;
         if (isIphone && (/iPhone OS [1-9](_\d+)?/i.test(ua))) return true;
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
       return false;
     }
-
-    // choose model id depending on lowPower flag
-    function getModelId() {
-      return lowPower ? SMALL_MODEL_ID : DEFAULT_MODEL_ID;
-    }
-
-    // adjust runtime caps based on device memory heuristics
     (function tuneForDevice() {
       if (isVeryLowMemoryDevice()) {
         REPLY_CHAR_CAP_LOW = 400;
@@ -203,84 +206,11 @@
       }
     })();
 
-    // wire chat scroll detection
-    (function wireChatScroll() {
-      chat.addEventListener('scroll', () => {
-        const near = (chat.scrollTop + chat.clientHeight) >= (chat.scrollHeight - 80);
-        userIsNearBottom = near;
-      }, { passive: true });
-    })();
-
-    // render message window
-    function renderMessageWindow() {
-      chat.innerHTML = '';
-
-      if (displayStart > 0) {
-        const loadBtn = document.createElement('button');
-        loadBtn.className = 'btn';
-        loadBtn.textContent = 'Load earlier';
-        loadBtn.style.margin = '6px 0';
-        loadBtn.addEventListener('click', () => {
-          displayStart = Math.max(0, displayStart - MESSAGE_WINDOW);
-          renderMessageWindow();
-          requestAnimationFrame(() => { chat.scrollTop = 1; });
-        });
-        const wrapper = document.createElement('div');
-        wrapper.style.display = 'flex';
-        wrapper.style.justifyContent = 'center';
-        wrapper.appendChild(loadBtn);
-        chat.appendChild(wrapper);
-      }
-
-      const end = Math.min(allMessages.length, displayStart + MESSAGE_WINDOW);
-      for (let i = displayStart; i < end; i++) {
-        const m = allMessages[i];
-        const d = document.createElement('div');
-        d.className = (m.className ? m.className + ' ' : '') + 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
-        d.textContent = m.text;
-        chat.appendChild(d);
-      }
-
-      if ((displayStart + MESSAGE_WINDOW) < allMessages.length) {
-        const newerBtn = document.createElement('button');
-        newerBtn.className = 'btn';
-        newerBtn.textContent = 'Load newer';
-        newerBtn.style.margin = '6px 0';
-        newerBtn.addEventListener('click', () => {
-          const maxStart = Math.max(0, allMessages.length - MESSAGE_WINDOW);
-          displayStart = Math.min(maxStart, displayStart + MESSAGE_WINDOW);
-          renderMessageWindow();
-          requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
-        });
-        const wrapper2 = document.createElement('div');
-        wrapper2.style.display = 'flex';
-        wrapper2.style.justifyContent = 'center';
-        wrapper2.appendChild(newerBtn);
-        chat.appendChild(wrapper2);
-      }
-
-      if (userIsNearBottom) {
-        requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
-      }
-    }
-
-    // append message to windowed store
-    function appendMessageWindowed(role, text, opts = {}) {
-      const entry = { role, text, className: opts.className || '' };
-      allMessages.push(entry);
-      if (allMessages.length > ALL_MESSAGES_STORE_CAP) {
-        allMessages.shift();
-        if (displayStart > 0) displayStart = Math.max(0, displayStart - 1);
-      }
-      const showingTail = (displayStart + MESSAGE_WINDOW) >= (allMessages.length - 1);
-      if (showingTail) {
-        displayStart = Math.max(0, allMessages.length - MESSAGE_WINDOW);
-      } else {
-        if (allMessages.length <= MESSAGE_WINDOW) displayStart = 0;
-      }
-      renderMessageWindow();
-    }
-    const appendMessage = appendMessageWindowed;
+    // wire scroll detection
+    chat.addEventListener('scroll', () => {
+      const near = (chat.scrollTop + chat.clientHeight) >= (chat.scrollHeight - 80);
+      userIsNearBottom = near;
+    }, { passive: true });
 
     function clampString(s, maxChars){
       if(!s) return '';
@@ -288,31 +218,25 @@
       return s.slice(0, maxChars - 3) + '...';
     }
 
-    // overlay controls: throttled updates to reduce DOM churn
+    // overlay helpers
     let lastOverlayProgress = -1;
-    let lastOverlayUpdateTime = 0;
     function showOverlay(title='Preparing model…', sub='Optimizing for low-memory', progress=0){
       const p = Math.max(0, Math.min(1, progress));
-      const now = Date.now();
-      if (Math.abs(p - lastOverlayProgress) < 0.02 && (now - lastOverlayUpdateTime) < 150 && overlay.style.display === 'flex') {
-        overlayTitle.textContent = title;
-        overlaySub.textContent = sub;
-        return;
-      }
-      lastOverlayProgress = p;
-      lastOverlayUpdateTime = now;
+      overlay.style.display = 'flex';
       overlayTitle.textContent = title;
       overlaySub.textContent = sub;
       overlayBar.style.width = `${Math.round(p * 100)}%`;
-      overlay.style.display = 'flex';
-      overlay.setAttribute('aria-hidden', 'false');
     }
-    function hideOverlay(){ overlay.style.display = 'none'; overlay.setAttribute('aria-hidden', 'true'); overlayBar.style.width = '0%'; lastOverlayProgress = -1; }
+    function hideOverlay(){ overlay.style.display = 'none'; overlayBar.style.width = '0%'; lastOverlayProgress = -1; }
 
-    // create engine safely with timeout and UI-yielding — uses model chosen by getModelId()
-    async function createEngineWithProgressSafe(timeoutMs = 30000) {
+    // pick model id based on lowPower
+    function getModelId() { return lowPower ? SMALL_MODEL_ID : DEFAULT_MODEL_ID; }
+
+    // safe engine creation with diagnostics and fallback
+    async function createEngineWithProgressSafe(timeoutMs = 30000, modelIdOverride = null) {
+      const modelId = modelIdOverride || getModelId();
+      appendMessage('assistant', `Loading model ${modelId}...`);
       await new Promise(requestAnimationFrame);
-      const modelId = getModelId();
       const createPromise = webllm.CreateMLCEngine(modelId, {
         initProgressCallback: (report) => {
           const p = Math.max(0, Math.min(1, (report && report.progress) || 0));
@@ -321,86 +245,49 @@
         }
       });
 
-      let timedOut = false;
       const timeoutPromise = new Promise((_, reject) => {
-        const id = setTimeout(() => {
-          timedOut = true;
-          reject(new Error('Engine creation timed out'));
-        }, timeoutMs);
-        createPromise.then(() => clearTimeout(id)).catch(() => clearTimeout(id));
+        const id = setTimeout(() => reject(new Error(`Engine creation timed out after ${timeoutMs}ms for model ${modelId}`)), timeoutMs);
+        createPromise.finally(() => clearTimeout(id));
       });
 
       try {
         const engineInstance = await Promise.race([createPromise, timeoutPromise]);
         try { localStorage.setItem(MODEL_DOWNLOADED_KEY, '1'); } catch(e){}
         hideOverlay();
+        appendMessage('assistant', `Model ${modelId} loaded.`);
         return engineInstance;
       } catch (err) {
-        console.warn('Engine create failed or timed out:', err);
-        try {
-          const maybeEngine = await createPromise.catch(() => null);
-          if (maybeEngine && typeof maybeEngine.unload === 'function') {
-            await maybeEngine.unload();
-          }
-        } catch (e) {
-          console.warn('Cleanup after failed create also failed', e);
-        }
         hideOverlay();
+        appendMessage('assistant', `Failed to load model ${modelId}: ${err.message}`);
+        // fallback to default if not already tried
+        if (modelId !== DEFAULT_MODEL_ID) {
+          appendMessage('assistant', `Attempting fallback model ${DEFAULT_MODEL_ID}...`);
+          return createEngineWithProgressSafe(timeoutMs, DEFAULT_MODEL_ID);
+        }
         throw err;
       }
     }
 
-    // persistence helpers (traits + small cache)
-    function loadTraits(){ try { const r = localStorage.getItem(TRAITS_KEY); return r ? JSON.parse(r).slice(0,MAX_TRAITS) : []; } catch { return []; } }
-    function saveTraits(arr){ try { localStorage.setItem(TRAITS_KEY, JSON.stringify((arr||[]).slice(0,MAX_TRAITS))); } catch {} }
-    function modelDownloadedFlag(){ try { return localStorage.getItem(MODEL_DOWNLOADED_KEY) === '1'; } catch { return false; } }
-    function setModelDownloadedFlag(){ try { localStorage.setItem(MODEL_DOWNLOADED_KEY, '1'); } catch {} }
-
-    function loadReasoningCache(){
+    // quick test loader accessible from UI
+    async function testModelLoad() {
+      appendMessage('assistant', `Testing load for model ${getModelId()}...`);
       try {
-        const raw = localStorage.getItem(REASONING_CACHE_KEY);
-        if (!raw) return {};
-        const obj = JSON.parse(raw);
-        return obj && typeof obj === 'object' ? obj : {};
-      } catch { return {}; }
-    }
-    function saveReasoningCache(cache){
-      try {
-        const keys = Object.keys(cache || {});
-        if (keys.length > 50) {
-          keys.sort((a,b) => cache[a].t - cache[b].t);
-          for (let i=0;i<keys.length-50;i++) delete cache[keys[i]];
-        }
-        localStorage.setItem(REASONING_CACHE_KEY, JSON.stringify(cache));
-      } catch {}
-    }
-    function getCachedReasoning(key){ const c = loadReasoningCache(); return c[key] ? c[key].v : null; }
-    function setCachedReasoning(key, value){ const c = loadReasoningCache(); c[key] = { v: value, t: Date.now() }; saveReasoningCache(c); }
-
-    // system prompt tuned for low-power only
-    function buildSystemPrompt(){
-      const traits = userTraits.slice(0, LOWPOWER_TRAITS);
-      const compact = traits.map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).join(' | ');
-      const prob = "Treat outputs as probabilistic predictions; avoid overconfidence. Provide a single-line 'Answer:' as the final output. Keep replies extremely short.";
-      const base = "Concise assistant. Keep replies extremely short.";
-      const systemRaw = compact ? `${base} User: ${compact}. ${prob}` : `${base} ${prob}`;
-      return clampString(systemRaw, SYSTEM_PROMPT_CHAR_CAP);
+        const eng = await createEngineWithProgressSafe(45000);
+        appendMessage('assistant', `Test load succeeded for ${getModelId()}.`);
+        try { await eng.unload(); } catch(e){ console.warn('unload after test failed', e); }
+      } catch (e) {
+        appendMessage('assistant', `Model test failed: ${e.message}`);
+        console.error('Model test failed', e);
+      }
     }
 
-    function buildMessages(userText){
-      const system = buildSystemPrompt();
-      const recent = [];
-      return [{ role: 'system', content: system }, ...recent, { role: 'user', content: userText }];
-    }
-
-    // parse "Answer:" style outputs
+    // parsing and trivial detection
     function extractAnswer(fullText) {
       if (!fullText) return '';
-      const answerMatch = fullText.match(/Answer\s*:\s*([\s\S]*)$/i);
-      if (answerMatch) return answerMatch[1].trim();
+      const m = fullText.match(/Answer\s*:\s*([\s\S]*)$/i);
+      if (m) return m[1].trim();
       return fullText.trim();
     }
-
     function isTrivial(text) {
       if (!text) return true;
       const t = text.trim();
@@ -409,76 +296,59 @@
       return false;
     }
 
-    // aggressive reset and retry (unload, prune DOM, probe, retry)
-    async function aggressiveResetAndRetry(originalUserText) {
-      appendMessage('assistant', 'Trying to refresh my mind...');
-      sendBtn.disabled = true;
-
-      requestQueue.length = 0;
-
-      try { while (chat.children.length > 2) chat.removeChild(chat.firstChild); } catch (e) {}
-      try { if (engine && typeof engine.unload === 'function') await engine.unload(); } catch (e) {}
-      engine = null;
-
-      await new Promise(resolve => setTimeout(resolve, 600));
-      try { localStorage.removeItem(REASONING_CACHE_KEY); } catch(e){}
-
-      try {
-        const probe = await createEngineWithProgressSafe(15000);
-        try { if (probe && typeof probe.unload === 'function') await probe.unload(); } catch(e){}
-        appendMessage('assistant', 'I refreshed successfully. Retrying your question...');
-        await new Promise(resolve => setTimeout(resolve, 300));
-        if (originalUserText && originalUserText.trim()) {
-          await handleSingleRequest(originalUserText, /*retriesLeft*/ 0);
-        }
-        sendBtn.disabled = false;
-        return true;
-      } catch (probeErr) {
-        appendMessage('assistant', 'I could not refresh fully. Performing a quick page refresh to free memory...');
-        setTimeout(() => {
-          try { window.location.reload(); } catch (reloadErr) { appendMessage('assistant', 'Automatic reload failed. Please refresh manually.'); sendBtn.disabled = false; }
-        }, 700);
-        return false;
-      }
-    }
-
-    // Recovery direct answer: quick single-line attempt (lightweight)
+    // recovery small direct answer
     async function recoveryDirectAnswer(userText) {
       try {
         const eng = await createEngineWithProgressSafe(20000);
         const sys = "Concise assistant. Provide a single-line direct answer to the user's question. Do NOT include 'Certainty' or steps — just the answer.";
-        const messages = [{ role: 'system', content: sys }, { role: 'user', content: userText }];
-        const chunks = await eng.chat.completions.create({ messages, stream: true });
+        const msgs = [{ role:'system', content: sys }, { role:'user', content: userText }];
+        const chunks = await eng.chat.completions.create({ messages: msgs, stream: true });
         let text = '';
         for await (const chunk of chunks) {
-          const delta = chunk?.choices?.[0]?.delta?.content || '';
-          if (delta) {
-            text += delta;
-            if (text.length > REPLY_CHAR_CAP_LOW) {
-              text = text.slice(0, REPLY_CHAR_CAP_LOW) + '\n\n[truncated]';
-              break;
-            }
+          const d = chunk?.choices?.[0]?.delta?.content || '';
+          if (d) {
+            text += d;
+            if (text.length > REPLY_CHAR_CAP_LOW) { text = text.slice(0, REPLY_CHAR_CAP_LOW) + '\n\n[truncated]'; break; }
           }
         }
         try { await eng.unload(); } catch(e){}
         return text.trim();
-      } catch (err) { console.warn('Direct recovery failed', err); return null; }
+      } catch (e) { console.warn('Direct recovery failed', e); return null; }
     }
 
-    // core request processing with safe engine creation and thinking placeholder
-    async function handleSingleRequest(userText, retriesLeft = MAX_RESET_RETRIES) {
-      const replyCharCap = REPLY_CHAR_CAP_LOW;
-      const messages = buildMessages(userText);
+    // reset + probe + retry
+    async function aggressiveResetAndRetry(originalUserText) {
+      appendMessage('assistant', 'Trying to refresh my mind...');
+      sendBtn.disabled = true;
+      requestQueue.length = 0;
+      try { while (chat.children.length > 2) chat.removeChild(chat.firstChild); } catch(e){}
+      try { if (engine && typeof engine.unload === 'function') await engine.unload(); } catch(e){}
+      engine = null;
+      await new Promise(r => setTimeout(r, 600));
+      try { localStorage.removeItem(REASONING_CACHE_KEY); } catch(e){}
+      try {
+        const probe = await createEngineWithProgressSafe(15000);
+        try { if (probe && typeof probe.unload === 'function') await probe.unload(); } catch(e){}
+        appendMessage('assistant', 'I refreshed successfully. Retrying your question...');
+        await new Promise(r => setTimeout(r, 300));
+        if (originalUserText && originalUserText.trim()) await handleSingleRequest(originalUserText, 0);
+        sendBtn.disabled = false;
+        return true;
+      } catch (err) {
+        appendMessage('assistant', 'Could not refresh; reloading page...');
+        setTimeout(() => { try { window.location.reload(); } catch(e) { appendMessage('assistant','Please reload the page manually.'); } }, 700);
+        return false;
+      }
+    }
 
+    // main handler with thinking placeholder and reveal delay
+    async function handleSingleRequest(userText, retriesLeft = MAX_RESET_RETRIES) {
+      appendMessage('user', userText);
       appendMessage('assistant', 'Thinking...', { className: 'thinking' });
 
-      const alreadyDownloaded = modelDownloadedFlag();
-      if (!alreadyDownloaded) {
-        showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
-        await new Promise(requestAnimationFrame);
-      } else {
-        await new Promise(requestAnimationFrame);
-      }
+      const alreadyDownloaded = !!localStorage.getItem(MODEL_DOWNLOADED_KEY);
+      if (!alreadyDownloaded) showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
+      await new Promise(requestAnimationFrame);
 
       sendBtn.disabled = true;
       let localEngine = null;
@@ -487,97 +357,88 @@
       try {
         localEngine = await createEngineWithProgressSafe(30000);
         engine = localEngine;
+        const messages = buildMessages(userText);
         const chunks = await localEngine.chat.completions.create({ messages, stream: true });
         for await (const chunk of chunks) {
-          const delta = chunk?.choices?.[0]?.delta?.content || '';
-          if (delta) {
-            fullReply += delta;
-            if (fullReply.length > replyCharCap) {
-              fullReply = fullReply.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
-              break;
-            }
+          const d = chunk?.choices?.[0]?.delta?.content || '';
+          if (d) {
+            fullReply += d;
+            if (fullReply.length > REPLY_CHAR_CAP_LOW) { fullReply = fullReply.slice(0, REPLY_CHAR_CAP_LOW) + '\n\n[truncated]'; break; }
             if (fullReply.length % 200 === 0) await new Promise(requestAnimationFrame);
           }
         }
-
-        try { await localEngine.unload(); } catch(e) { console.warn('unload error', e); }
+        try { await localEngine.unload(); } catch(e){}
         engine = null;
         localEngine = null;
-
         hideOverlay();
 
         if (isTrivial(fullReply) && retriesLeft > 0) {
           const direct = await recoveryDirectAnswer(userText);
           if (direct && !isTrivial(direct)) fullReply = direct;
         }
-
         if (!fullReply || !fullReply.trim()) fullReply = "I couldn't produce an answer. Try again.";
 
-        const minDelayMs = 6000;
-        const maxDelayMs = 20000;
-        const revealDelay = Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1)) + minDelayMs;
-        const adjustedDelay = Math.min(revealDelay, 12000);
+        // reveal delay (6-12s capped)
+        const minDelayMs = 6000, maxDelayMs = 12000;
+        const adjustedDelay = Math.min(maxDelayMs, Math.floor(Math.random() * (20000 - minDelayMs + 1)) + minDelayMs);
+        await new Promise(r => setTimeout(r, adjustedDelay));
 
-        await new Promise(resolve => setTimeout(resolve, adjustedDelay));
-
-        // remove earliest thinking placeholder if present
-        let removed = false;
+        // remove earliest Thinking... placeholder if present
         for (let i = 0; i < allMessages.length; i++) {
-          if (allMessages[i] && allMessages[i].text === 'Thinking...' && allMessages[i].className && allMessages[i].className.includes('thinking')) {
-            allMessages.splice(i, 1);
-            removed = true;
-            if (displayStart > 0) displayStart = Math.max(0, displayStart - 1);
-            break;
-          }
+          if (allMessages[i] && allMessages[i].text === 'Thinking...') { allMessages.splice(i,1); if (displayStart > 0) displayStart = Math.max(0, displayStart - 1); break; }
         }
-        if (!removed) {
-          for (let i = 0; i < allMessages.length; i++) {
-            if (allMessages[i] && allMessages[i].text === 'Thinking...') {
-              allMessages.splice(i, 1);
-              if (displayStart > 0) displayStart = Math.max(0, displayStart - 1);
-              break;
-            }
-          }
-        }
-
         appendMessage('assistant', extractAnswer(fullReply));
-
-        history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
-        const maxEntries = HISTORY_TURNS_LOW * 2;
-        if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
-        if (maxEntries === 0) history = [];
-
       } catch (err) {
-        console.error('Inference/create error', err);
-        // remove thinking placeholder if present
-        for (let i = allMessages.length - 1; i >= 0; i--) {
-          if (allMessages[i] && allMessages[i].text === 'Thinking...') {
-            allMessages.splice(i, 1);
-            break;
-          }
+        console.error('Inference error', err);
+        for (let i = allMessages.length-1; i >= 0; i--) {
+          if (allMessages[i] && allMessages[i].text === 'Thinking...') { allMessages.splice(i,1); break; }
         }
         try { if (localEngine) await localEngine.unload(); } catch(e){}
-        engine = null;
-        localEngine = null;
-        hideOverlay();
+        engine = null; localEngine = null; hideOverlay();
+        if (retriesLeft > 0) await aggressiveResetAndRetry(userText);
+        else appendMessage('assistant', 'I had a memory spike and could not recover. Try again later.');
+      } finally { sendBtn.disabled = false; }
+    }
 
-        if (retriesLeft > 0) {
-          await aggressiveResetAndRetry(userText);
-        } else {
-          appendMessage('assistant', 'I had a memory spike and could not recover. Try again later.');
-        }
-      } finally {
-        sendBtn.disabled = false;
+    function buildSystemPrompt(){
+      const compact = (userTraits || []).slice(0,LOWPOWER_TRAITS).join(' | ');
+      const prob = "Treat outputs as probabilistic predictions; avoid overconfidence. Provide a single-line 'Answer:' as the final output. Keep replies extremely short.";
+      const base = "Concise assistant. Keep replies extremely short.";
+      const systemRaw = compact ? `${base} User: ${compact}. ${prob}` : `${base} ${prob}`;
+      return clampString(systemRaw, SYSTEM_PROMPT_CHAR_CAP);
+    }
+    function buildMessages(userText){
+      return [{ role:'system', content: buildSystemPrompt() }, { role:'user', content: userText }];
+    }
+
+    // testModel button wiring
+    testModelBtn.addEventListener('click', () => {
+      testModelBtn.disabled = true;
+      testModelLoad().finally(() => { testModelBtn.disabled = false; });
+    });
+
+    // Test loader function
+    async function testModelLoad() {
+      appendMessage('assistant', `Testing load for model ${getModelId()}...`);
+      try {
+        const eng = await createEngineWithProgressSafe(45000);
+        appendMessage('assistant', `Test load succeeded for ${getModelId()}.`);
+        try { await eng.unload(); } catch(e){}
+      } catch (e) {
+        appendMessage('assistant', `Model test failed: ${e.message}`);
+        console.error('Model test failed', e);
       }
     }
 
-    // queue request
-    function queueRequest(userText){
-      if (!userText || !userText.trim()) return;
-      appendMessage('user', userText);
-      requestQueue.push({ userText });
-      processQueue();
-    }
+    // UI wiring for send
+    sendBtn.addEventListener('click', () => {
+      const txt = userInput.value.trim();
+      if (!txt) return;
+      userInput.value = '';
+      requestQueue.push({ userText: txt });
+      if (!processing) processQueue();
+    });
+    userInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendBtn.click(); } });
 
     // process queue
     async function processQueue(){
@@ -586,92 +447,32 @@
       while (requestQueue.length) {
         const req = requestQueue.shift();
         await handleSingleRequest(req.userText);
-        await new Promise(resolve => setTimeout(resolve, 120));
+        await new Promise(r => setTimeout(r, 120));
       }
       processing = false;
     }
 
-    // UI wiring
-    sendBtn.addEventListener('click', () => {
-      const txt = userInput.value.trim();
-      if (!txt) return;
-      userInput.value = '';
-      queueRequest(txt);
-    });
-    userInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendBtn.click(); } });
-
     // Reset button
     resetBtn.addEventListener('click', async () => {
-      history = [];
-      allMessages.length = 0;
-      displayStart = 0;
-      renderMessageWindow();
-      appendMessage('assistant', 'Memory purged. Ready.');
+      allMessages.length = 0; displayStart = 0; renderMessageWindow(); appendMessage('assistant','Memory purged. Ready.');
       requestQueue.length = 0;
-      try { if (engine) await engine.unload(); } catch(e){}
+      try { if (engine) await engine.unload(); } catch(e) {}
       engine = null;
     });
 
-    // Low-power toggle wiring — default ON if not set
+    // Low-power default behavior
     const lowPowerRaw = loadLowPowerRaw();
-    if (lowPowerRaw === null) {
-      lowPower = true;
-      saveLowPower(true);
-    } else {
-      lowPower = loadLowPower();
-    }
+    if (lowPowerRaw === null) { lowPower = true; saveLowPower(true); } else lowPower = loadLowPower();
     lowPowerToggle.checked = lowPower;
     lowPowerToggle.addEventListener('change', (e) => {
       lowPower = !!e.target.checked;
       saveLowPower(lowPower);
-      appendMessage('assistant', lowPower ? `Low Power enabled — using ${getModelId()} model.` : `Low Power disabled — using ${getModelId()} model.`);
+      appendMessage('assistant', lowPower ? `Low Power enabled — using ${getModelId()}` : `Low Power disabled — using ${getModelId()}`);
     });
 
-    // Traits wiring
-    function openTraits(){ renderTraitsModal(); traitsOverlay.style.display = 'flex'; traitsOverlay.setAttribute('aria-hidden','false'); }
-    function closeTraits(){ traitsOverlay.style.display = 'none'; traitsOverlay.setAttribute('aria-hidden','true'); }
-
-    function renderTraitsModal(){
-      traitsEditor.innerHTML = '';
-      traitsChips.innerHTML = '';
-      userTraits.forEach((t, idx) => {
-        const chip = document.createElement('div'); chip.className = 'chip'; chip.textContent = t; traitsChips.appendChild(chip);
-        const row = document.createElement('div');
-        row.style.display = 'flex'; row.style.gap = '8px'; row.style.alignItems = 'center';
-        const input = document.createElement('input'); input.value = t; input.placeholder = `Trait ${idx+1}`;
-        input.addEventListener('input', () => userTraits[idx] = input.value);
-        const rm = document.createElement('button'); rm.className = 'btn'; rm.textContent = 'Remove';
-        rm.addEventListener('click', () => { userTraits.splice(idx,1); renderTraitsModal(); });
-        row.appendChild(input); row.appendChild(rm);
-        traitsEditor.appendChild(row);
-      });
-      traitsCount.textContent = `${userTraits.length}/${MAX_TRAITS}`;
-    }
-
-    addTraitBtn.addEventListener('click', () => {
-      if (userTraits.length >= MAX_TRAITS) return;
-      userTraits.push('');
-      renderTraitsModal();
-    });
-    saveTraitsBtn.addEventListener('click', () => {
-      userTraits = userTraits.map(s => (s || '').trim()).filter(Boolean).slice(0, MAX_TRAITS);
-      saveTraits(userTraits);
-      closeTraits();
-      appendMessage('assistant', 'Traits saved.');
-    });
-    cancelTraitsBtn.addEventListener('click', () => closeTraits());
-    traitsBtn.addEventListener('click', () => openTraits());
-
-    // initial load
-    userTraits = loadTraits();
-    if (!userTraits || !userTraits.length) {
-      userTraits = ['Concise','English'];
-      saveTraits(userTraits);
-    }
-
+    // initial UI message
     appendMessage('assistant', `Ready. Low Power mode is primary. Model: ${getModelId()}`);
-
-    try { userInput.focus(); } catch(e){}
+    try { userInput.focus(); } catch(e) {}
   </script>
 </body>
 </html>
