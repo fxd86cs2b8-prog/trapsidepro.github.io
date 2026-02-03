@@ -10,9 +10,15 @@
   </script>
 
   <style>
-    /* UI: clean, mobile-friendly, lightweight */
-    :root{
-      --bg1:#e6efff; --bg2:#f4f7fb; --primary:#007AFF; --accent:#5856D6; --muted:#8e8e93; --card:rgba(255,255,255,0.92);
+    /* Slimmed + nicer UI while keeping it light for older phones */
+    :root {
+      --bg1: #e6efff;
+      --bg2: #f4f7fb;
+      --primary: #007AFF;
+      --accent: #5856D6;
+      --muted: #8e8e93;
+      --card: rgba(255,255,255,0.92);
+      --glass: rgba(255,255,255,0.78);
     }
     html,body{height:100%;margin:0;font-family:-apple-system,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(160deg,var(--bg1),var(--bg2));-webkit-font-smoothing:antialiased}
     .card{width:94%;max-width:470px;margin:4vh auto;height:92vh;background:var(--card);border-radius:18px;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);box-shadow:0 8px 30px rgba(21,28,40,0.08)}
@@ -36,7 +42,7 @@
     button#send{background:linear-gradient(90deg,var(--primary),var(--accent));color:#fff;border:none;padding:10px 14px;border-radius:14px;cursor:pointer;box-shadow:0 6px 18px rgba(0,122,255,0.12)}
     button:disabled{opacity:0.5;cursor:not-allowed}
 
-    /* overlay + modal (first-time only) */
+    /* overlay + modal */
     .overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(8,12,20,0.12);z-index:60;padding:20px}
     .progressModal{width:88%;max-width:420px;background:var(--card);border-radius:12px;padding:14px;text-align:center;box-shadow:0 12px 40px rgba(6,10,18,0.12)}
     .progressBar{height:8px;background:#eee;border-radius:8px;overflow:hidden;margin-top:12px}
@@ -50,11 +56,6 @@
     .traitsEditor input{padding:8px;border-radius:8px;border:1px solid #eee}
     .modalActions{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
 
-    /* reasoning block */
-    .reasoning {background:linear-gradient(180deg,#fbfdff,#f5f8ff);border:1px solid rgba(0,0,0,0.03);padding:8px;border-radius:12px;margin-top:6px;font-size:13px;color:#0b1220}
-    .reasoning .step {margin:4px 0;padding-left:6px}
-    .reason-toggle{display:inline-flex;gap:8px;align-items:center;font-size:13px;cursor:pointer}
-
     @media (max-width:360px){
       .card{width:98%;height:94vh}
       .msg{font-size:14px}
@@ -63,7 +64,7 @@
 </head>
 <body>
   <div class="card" id="card">
-    <!-- overlay used for first-time download ONLY -->
+    <!-- small overlay used for progress ONLY on first-time download -->
     <div class="overlay" id="overlay" aria-hidden="true">
       <div class="progressModal" id="progressModal" role="status" aria-live="polite">
         <div style="font-weight:600" id="overlayTitle">Preparing model…</div>
@@ -78,17 +79,6 @@
         <label class="toggle" title="Low Power Mode">
           <input id="lowPowerToggle" type="checkbox" />
         </label>
-
-        <!-- Chain-of-Thought toggle -->
-        <label class="toggle" title="Enable brief step-by-step reasoning">
-          <input id="cotToggle" type="checkbox" />
-        </label>
-
-        <!-- Always show reasoning inline toggle -->
-        <label class="toggle" title="Show reasoning inline">
-          <input id="showReasoningToggle" type="checkbox" />
-        </label>
-
         <button class="btn" id="traitsBtn">Traits</button>
         <button class="btn btn--danger" id="resetBtn">Reset</button>
       </div>
@@ -129,20 +119,18 @@
   <script type="module">
     import * as webllm from "@mlc-ai/web-llm";
 
-    // Config and caps
+    // Config and caps (tune these aggressively for older devices)
     const MODEL_ID = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC";
     const MAX_TRAITS = 7;
     const LOWPOWER_TRAITS = 3;
     const HISTORY_TURNS_NORMAL = 1;      // user+assistant
     const HISTORY_TURNS_LOW = 0;
     const REPLY_CHAR_CAP_NORMAL = 2400;  // ~600 tokens estimate
-    const REPLY_CHAR_CAP_LOW = 900;      // strict low-power
-    const SYSTEM_PROMPT_CHAR_CAP = 420;  // cap system prompt
+    const REPLY_CHAR_CAP_LOW = 900;      // stricter for low-power
+    const SYSTEM_PROMPT_CHAR_CAP = 420;  // maximum chars for system prompt to avoid large starts
     const TRAITS_KEY = 'qwen_user_traits_v1';
     const LOWPOWER_KEY = 'qwen_lowpower_v1';
-    const COT_KEY = 'qwen_cot_v1';
-    const SHOW_REASONING_KEY = 'qwen_show_reasoning_v1';
-    const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1';
+    const MODEL_DOWNLOADED_KEY = 'qwen_model_downloaded_v1'; // new: remember first-time download
 
     // UI refs
     const chat = document.getElementById('chat');
@@ -154,11 +142,9 @@
     const overlaySub = document.getElementById('overlaySub');
     const overlayBar = document.getElementById('overlayBar');
     const lowPowerToggle = document.getElementById('lowPowerToggle');
-    const cotToggle = document.getElementById('cotToggle');
-    const showReasoningToggle = document.getElementById('showReasoningToggle');
     const traitsBtn = document.getElementById('traitsBtn');
 
-    // modal refs
+    // traits modal refs
     const traitsOverlay = document.getElementById('traitsOverlay');
     const traitsEditor = document.getElementById('traitsEditor');
     const traitsChips = document.getElementById('traitsChips');
@@ -167,32 +153,28 @@
     const cancelTraitsBtn = document.getElementById('cancelTraitsBtn');
     const traitsCount = document.getElementById('traitsCount');
 
-    // state
+    // State
     let userTraits = [];
     let lowPower = false;
-    let cotEnabled = false;
-    let showReasoningInline = false;
-    let history = [];
+    let history = []; // external history as alternating user/assistant entries
     let engine = null;
+
+    // Single-run queue and a processing flag to avoid concurrent boots
     const requestQueue = [];
     let processing = false;
 
-    // persistence helpers
+    // Persistence
     function loadTraits(){ try { const r = localStorage.getItem(TRAITS_KEY); return r ? JSON.parse(r).slice(0,MAX_TRAITS) : []; } catch { return []; } }
     function saveTraits(arr){ try { localStorage.setItem(TRAITS_KEY, JSON.stringify((arr||[]).slice(0,MAX_TRAITS))); } catch {} }
     function loadLowPower(){ try { return localStorage.getItem(LOWPOWER_KEY) === '1'; } catch { return false; } }
     function saveLowPower(v){ try { localStorage.setItem(LOWPOWER_KEY, v ? '1' : '0'); } catch {} }
-    function loadCoT(){ try { return localStorage.getItem(COT_KEY) === '1'; } catch { return false; } }
-    function saveCoT(v){ try { localStorage.setItem(COT_KEY, v ? '1' : '0'); } catch {} }
-    function loadShowReasoning(){ try { return localStorage.getItem(SHOW_REASONING_KEY) === '1'; } catch { return false; } }
-    function saveShowReasoning(v){ try { localStorage.setItem(SHOW_REASONING_KEY, v ? '1' : '0'); } catch {} }
     function modelDownloadedFlag(){ try { return localStorage.getItem(MODEL_DOWNLOADED_KEY) === '1'; } catch { return false; } }
     function setModelDownloadedFlag(){ try { localStorage.setItem(MODEL_DOWNLOADED_KEY, '1'); } catch {} }
 
-    // helpers
+    // Small helpers
     function appendMessage(role, text){
       const d = document.createElement('div');
-      d.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+      d.className = 'msg '+(role==='user'?'user':'assistant');
       d.textContent = text;
       chat.appendChild(d);
       chat.scrollTop = chat.scrollHeight;
@@ -202,23 +184,25 @@
     function clampString(s, maxChars){
       if(!s) return '';
       if(s.length <= maxChars) return s;
-      return s.slice(0, maxChars - 3) + '...';
+      return s.slice(0, maxChars-3) + '...';
     }
 
-    // overlay controls (first-time only)
+    // Overlay controls (note: overlay only used for first-time download)
     function showOverlay(title='Preparing model…', sub='Optimizing for low-memory', progress=0){
       overlayTitle.textContent = title;
       overlaySub.textContent = sub;
-      overlayBar.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
+      overlayBar.style.width = `${Math.max(0,Math.min(1,progress))*100}%`;
       overlay.style.display = 'flex';
-      overlay.setAttribute('aria-hidden', 'false');
+      overlay.setAttribute('aria-hidden','false');
     }
-    function hideOverlay(){ overlay.style.display = 'none'; overlay.setAttribute('aria-hidden', 'true'); overlayBar.style.width = '0%'; }
+    function hideOverlay(){ overlay.style.display = 'none'; overlay.setAttribute('aria-hidden','true'); overlayBar.style.width = '0%'; }
 
-    // Engine create with progress callback — sets downloaded flag on real download
+    // Engine create with progress callback
     async function createEngineWithProgress() {
+      // Decide whether we should show overlay for this run:
+      // Only show when model has never been downloaded (first-time). If the MODEL_DOWNLOADED_KEY exists, suppress overlay.
       const alreadyDownloaded = modelDownloadedFlag();
-      let downloadObserved = false;
+      let downloadObserved = false; // did we observe any progress < 1 (actual download) this run?
 
       const engine = await webllm.CreateMLCEngine(MODEL_ID, {
         initProgressCallback: (report) => {
@@ -226,237 +210,90 @@
           const text = (report && report.text) || '';
 
           if (!alreadyDownloaded) {
+            // Only show the overlay if we haven't seen a prior complete download marker.
+            // Show during progress phases (p < 1). When p >= 1, if we observed p<1 earlier, mark as downloaded.
             if (p < 1) {
               downloadObserved = true;
               showOverlay(text || 'Downloading model…', 'This happens only once on this device', p);
             } else {
-              if (downloadObserved) setModelDownloadedFlag();
+              // progress reached completion
+              if (downloadObserved) {
+                // This run performed a real download — remember so next boots won't show overlay
+                setModelDownloadedFlag();
+              }
               hideOverlay();
             }
+          } else {
+            // already downloaded on this device — do nothing (suppress overlay entirely)
+            // (We intentionally do not call showOverlay here)
           }
-          // if already downloaded, suppress any overlay
         }
       });
 
       return engine;
     }
 
-    // Compact traits encoding: short tags to minimize tokens (e.g., "t:concise,numbered,eng")
-    function compactTraitsTag(){
-      const traits = (userTraits || []).slice(0, MAX_TRAITS).map(t => t.replace(/\s+/g,' ').trim().toLowerCase().replace(/[^a-z0-9 ]/g,'').split(' ')[0]); // pick short word
-      if (!traits.length) return '';
-      // join with commas
-      return `t:${traits.slice(0, MAX_TRAITS).join(',')}`;
-    }
-
-    // build a compact system prompt that includes probabilistic reasoning + JSON-CoT policy
+    // Build a tight system prompt — compressed and capped
     function buildSystemPrompt(){
-      // traits tag
-      const tag = compactTraitsTag();
-      // Probabilistic guidance (tiny)
-      const prob = "Outputs are probabilistic; include Certainty:[High|Medium|Low].";
-      // CoT JSON instruction (very compact)
-      let cotInstr = "";
-      const stepsLimit = (cotEnabled ? (lowPower ? 1 : 5) : 0);
-      if (cotEnabled) {
-        cotInstr = `Respond ONLY with a single JSON object: {"reasoning":[...short steps], "answer":"...", "certainty":"High|Medium|Low"}. Limit reasoning to ${stepsLimit} short items. No extra text.`;
-      } else {
-        // No CoT: still require a JSON answer with empty reasoning array
-        cotInstr = `Respond ONLY with a single JSON object: {"reasoning":[], "answer":"...", "certainty":"High|Medium|Low"}. No extra text.`;
-      }
-
-      const base = lowPower ? "Be concise." : "Be concise.";
-      const parts = [base, tag, prob, cotInstr].filter(Boolean);
-      const system = parts.join(' ');
+      // if lowPower, only include first LOWPOWER_TRAITS traits
+      const traits = lowPower ? userTraits.slice(0,LOWPOWER_TRAITS) : userTraits.slice(0,MAX_TRAITS);
+      // Join into compact single-line items separated by ' | '
+      const compact = traits.map(t => t.replace(/\s+/g,' ').trim()).filter(Boolean).join(' | ');
+      const base = lowPower ? 'Concise assistant. Keep replies extremely short.' : 'Concise assistant. Keep replies short.';
+      const system = compact ? `${base} User: ${compact}` : base;
       return clampString(system, SYSTEM_PROMPT_CHAR_CAP);
     }
 
+    // Build messages; history turns are minimized in low power
     function buildMessages(userText){
       const system = buildSystemPrompt();
       const historyTurns = lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL;
       const turnsToKeep = historyTurns * 2;
-      const recent = history.slice(-turnsToKeep).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+      const recent = history.slice(-turnsToKeep).map(m => ({ role: m.role==='assistant' ? 'assistant' : 'user', content: m.content }));
       return [{ role: 'system', content: system }, ...recent, { role: 'user', content: userText }];
     }
 
-    // Extract JSON object from model reply text, fallback to legacy extraction
-    function extractJSONFromText(text) {
-      if (!text || !text.trim()) return null;
-      const first = text.indexOf('{');
-      const last = text.lastIndexOf('}');
-      if (first === -1 || last === -1 || last <= first) return null;
-      const maybe = text.slice(first, last + 1);
-      try {
-        const parsed = JSON.parse(maybe);
-        // Basic validation
-        if (parsed && (Array.isArray(parsed.reasoning) || typeof parsed.answer === 'string')) return parsed;
-      } catch (e) {
-        // try to fix common issues: single quotes -> double quotes
-        try {
-          const fixed = maybe.replace(/(['"])?([a-zA-Z0-9_]+)(['"])?:/g, '"$2":').replace(/'/g, '"');
-          const parsed2 = JSON.parse(fixed);
-          if (parsed2 && (Array.isArray(parsed2.reasoning) || typeof parsed2.answer === 'string')) return parsed2;
-        } catch (e2) {
-          return null;
-        }
-      }
-      return null;
-    }
-
-    // fallback extraction when JSON not returned
-    function extractReasoningAndAnswerFallback(fullText) {
-      // look for "Answer:" token (case-insensitive)
-      const answerMatch = fullText.match(/Answer\s*:\s*([\s\S]*)$/i);
-      if (answerMatch) {
-        const answer = answerMatch[1].trim();
-        const reasoningPart = fullText.slice(0, answerMatch.index).trim();
-        const steps = reasoningPart ? reasoningPart.split(/\r?\n/).map(s => s.trim()).filter(Boolean) : [];
-        return { steps, answer, certainty: null };
-      }
-      // try to extract certainty
-      const certMatch = fullText.match(/(.*)\nCertainty\s*:\s*(High|Medium|Low)/i);
-      if (certMatch) {
-        return { steps: [], answer: certMatch[1].trim(), certainty: certMatch[2] };
-      }
-      return { steps: [], answer: fullText.trim(), certainty: null };
-    }
-
-    // Render assistant reply: if JSON present, parse and render. Show reasoning inline if user toggled it on.
-    function renderAssistantReplyFromText(fullReply) {
-      const json = extractJSONFromText(fullReply);
-      if (json) {
-        const answerText = json.answer || '';
-        const certainty = json.certainty || '';
-        const steps = Array.isArray(json.reasoning) ? json.reasoning : [];
-
-        // assistant answer bubble
-        const assistantDiv = document.createElement('div');
-        assistantDiv.className = 'msg assistant';
-        assistantDiv.textContent = answerText + (certainty ? `\n\nCertainty: ${certainty}` : '');
-        chat.appendChild(assistantDiv);
-
-        if (steps.length > 0) {
-          const wrapper = document.createElement('div');
-          wrapper.style.display = 'flex';
-          wrapper.style.flexDirection = 'column';
-          wrapper.style.alignItems = 'flex-start';
-          wrapper.style.maxWidth = '78%';
-
-          const toggle = document.createElement('button');
-          toggle.className = 'btn';
-          toggle.textContent = showReasoningInline ? 'Hide reasoning' : 'Show reasoning';
-          toggle.style.marginTop = '6px';
-          toggle.style.padding = '6px 8px';
-          toggle.style.fontSize = '13px';
-
-          const reasoningBox = document.createElement('div');
-          reasoningBox.className = 'reasoning';
-          reasoningBox.style.display = showReasoningInline ? 'block' : 'none';
-
-          steps.forEach((s, i) => {
-            const stepEl = document.createElement('div');
-            stepEl.className = 'step';
-            stepEl.textContent = `${i+1}. ${s}`;
-            reasoningBox.appendChild(stepEl);
-          });
-
-          toggle.addEventListener('click', () => {
-            const visible = reasoningBox.style.display !== 'none';
-            reasoningBox.style.display = visible ? 'none' : 'block';
-            toggle.textContent = visible ? 'Show reasoning' : 'Hide reasoning';
-          });
-
-          wrapper.appendChild(toggle);
-          wrapper.appendChild(reasoningBox);
-          chat.appendChild(wrapper);
-        }
-
-        chat.scrollTop = chat.scrollHeight;
-        return;
-      }
-
-      // fallback: parse heuristically
-      const fallback = extractReasoningAndAnswerFallback(fullReply);
-      const assistantDiv = document.createElement('div');
-      assistantDiv.className = 'msg assistant';
-      assistantDiv.textContent = fallback.answer || fullReply || '…';
-      chat.appendChild(assistantDiv);
-
-      if (fallback.steps && fallback.steps.length) {
-        const wrapper = document.createElement('div');
-        wrapper.style.display = 'flex';
-        wrapper.style.flexDirection = 'column';
-        wrapper.style.alignItems = 'flex-start';
-        wrapper.style.maxWidth = '78%';
-
-        const toggle = document.createElement('button');
-        toggle.className = 'btn';
-        toggle.textContent = showReasoningInline ? 'Hide reasoning' : 'Show reasoning';
-        toggle.style.marginTop = '6px';
-        toggle.style.padding = '6px 8px';
-        toggle.style.fontSize = '13px';
-
-        const reasoningBox = document.createElement('div');
-        reasoningBox.className = 'reasoning';
-        reasoningBox.style.display = showReasoningInline ? 'block' : 'none';
-
-        fallback.steps.forEach((s, i) => {
-          const stepEl = document.createElement('div');
-          stepEl.className = 'step';
-          stepEl.textContent = `${i+1}. ${s}`;
-          reasoningBox.appendChild(stepEl);
-        });
-
-        toggle.addEventListener('click', () => {
-          const visible = reasoningBox.style.display !== 'none';
-          reasoningBox.style.display = visible ? 'none' : 'block';
-          toggle.textContent = visible ? 'Show reasoning' : 'Hide reasoning';
-        });
-
-        wrapper.appendChild(toggle);
-        wrapper.appendChild(reasoningBox);
-        chat.appendChild(wrapper);
-      }
-
-      chat.scrollTop = chat.scrollHeight;
-    }
-
-    // Core queue processing
+    // Core: process queue one-by-one
     async function processQueue(){
-      if (processing) return;
+      if(processing) return;
       processing = true;
-      while (requestQueue.length) {
+      while(requestQueue.length){
         const req = requestQueue.shift();
         await handleSingleRequest(req.userText);
+        // tiny pause for repaint and freeing resources between requests
         await new Promise(resolve => setTimeout(resolve, 100));
       }
       processing = false;
     }
 
-    // Handle single request implementing Method 4 and JSON-CoT constraints
-    async function handleSingleRequest(userText) {
+    // Handle a single user request (entire Method 4 lifecycle)
+    async function handleSingleRequest(userText){
       const replyCharCap = lowPower ? REPLY_CHAR_CAP_LOW : REPLY_CHAR_CAP_NORMAL;
       const messages = buildMessages(userText);
 
-      // Decide whether to show placeholder: remove/avoid "thinking" when lowPower is ON
-      let placeholder = null;
-      if (!lowPower) {
-        placeholder = appendMessage('assistant', '…');
-      }
+      // Optimistically append placeholders to the UI (we already did for the queued call)
+      const aiNode = appendMessage('assistant','…');
 
+      // Pre-render overlay to avoid freeze, but only if it's the real first-time download.
       const alreadyDownloaded = modelDownloadedFlag();
       if (!alreadyDownloaded) {
+        // show a title while we prepare for the download (only visible on first-time)
         showOverlay('Preparing engine…', 'First-time model download may take longer', 0);
+        // ensure the DOM paints
         await new Promise(requestAnimationFrame);
       } else {
+        // Do not show overlay; still yield a frame for smoothness
         await new Promise(requestAnimationFrame);
       }
 
       sendBtn.disabled = true;
 
       try {
+        // Boot engine; createEngineWithProgress will itself decide whether to display progress overlay
         engine = await createEngineWithProgress();
 
+        // If overlay was suppressed because model previously downloaded, createEngineWithProgress will not show it.
+        // Continue to inference
         const chunks = await engine.chat.completions.create({ messages, stream: true });
 
         let fullReply = '';
@@ -464,27 +301,21 @@
           const delta = chunk?.choices?.[0]?.delta?.content || '';
           if (delta) {
             fullReply += delta;
-            // update placeholder only when not lowPower
-            if (placeholder) placeholder.textContent = fullReply;
             if (fullReply.length > replyCharCap) {
               fullReply = fullReply.slice(0, replyCharCap) + '\n\n[truncated to fit device limits]';
-              if (placeholder) placeholder.textContent = fullReply;
+              aiNode.textContent = fullReply;
               break;
             }
+            aiNode.textContent = fullReply;
             chat.scrollTop = chat.scrollHeight;
           }
         }
 
-        try { await engine.unload(); } catch(e) {}
+        // Immediate purge
+        try { await engine.unload(); } catch(e) { /* ignore */ }
         engine = null;
 
-        // remove placeholder if present
-        if (placeholder) placeholder.remove();
-
-        // Render parsed JSON-like reply; if JSON isn't present, fallback rendering is used
-        renderAssistantReplyFromText(fullReply);
-
-        // persist history externally
+        // Persist externally and clamp history
         history.push({ role: 'user', content: userText }, { role: 'assistant', content: fullReply });
         const maxEntries = (lowPower ? HISTORY_TURNS_LOW : HISTORY_TURNS_NORMAL) * 2;
         if (maxEntries > 0 && history.length > maxEntries) history = history.slice(-maxEntries);
@@ -493,9 +324,9 @@
         hideOverlay();
       } catch (err) {
         console.error('Inference error', err);
-        if (placeholder) placeholder.remove();
-        appendMessage('assistant', 'I had a memory spike or connection error. Try again in a moment.');
-        try { if (engine) await engine.unload(); } catch(e){}
+        appendMessage('assistant','I had a memory spike or connection error. Try again in a moment.');
+        // Best-effort cleanup
+        try { if(engine) await engine.unload(); } catch(e){}
         engine = null;
         hideOverlay();
       } finally {
@@ -503,79 +334,62 @@
       }
     }
 
-    // queue request (adds to single-run queue)
+    // Enqueue a user request (ensures single-run)
     function queueRequest(userText){
-      if (!userText || !userText.trim()) return;
+      // Prevent blank messages
+      if(!userText || !userText.trim()) return;
+      // immediate UI feedback (append user message)
       appendMessage('user', userText);
       requestQueue.push({ userText });
+      // start processing if not already
       processQueue();
     }
 
     // UI wiring
     document.getElementById('send').addEventListener('click', () => {
       const txt = userInput.value.trim();
-      if (!txt) return;
+      if(!txt) return;
       userInput.value = '';
       queueRequest(txt);
     });
-    userInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('send').click(); } });
+    userInput.addEventListener('keypress', (e) => { if(e.key === 'Enter') { e.preventDefault(); document.getElementById('send').click(); } });
 
     // Reset
     resetBtn.addEventListener('click', async () => {
       history = [];
       chat.innerHTML = '<div class="msg assistant">Memory purged. Ready.</div>';
+      // clear queue
       requestQueue.length = 0;
-      try { if (engine) await engine.unload(); } catch(e) {}
+      // try unload
+      try { if(engine) await engine.unload(); } catch {}
       engine = null;
-      // do not clear modelDownloaded flag so overlay won't reappear
+      // Note: do NOT clear the downloaded flag so users don't see the download overlay again.
     });
 
-    // Low-power toggle wiring
+    // Low power toggle
     lowPower = loadLowPower();
     lowPowerToggle.checked = lowPower;
     lowPowerToggle.addEventListener('change', (e) => {
       lowPower = !!e.target.checked;
       saveLowPower(lowPower);
-      // if lowPower enabled, disable CoT to preserve memory (and sync toggle)
-      if (lowPower && cotEnabled) {
-        cotEnabled = false;
-        cotToggle.checked = false;
-        saveCoT(false);
-        appendMessage('assistant', 'Low Power enabled — reasoning limited to preserve memory.');
+      // brief non-blocking toast via overlay only if first-time model download hasn't happened
+      const alreadyDownloaded = modelDownloadedFlag();
+      if (!alreadyDownloaded) {
+        showOverlay(lowPower ? 'Low Power: ON' : 'Low Power: OFF', lowPower ? 'Context is minimized' : 'Normal mode', 0.25);
+        setTimeout(()=>hideOverlay(), 700);
       } else {
-        appendMessage('assistant', lowPower ? 'Low Power enabled.' : 'Low Power disabled.');
+        // if model already downloaded, do minimal visual feedback (no overlay)
+        // flash a small ephemeral assistant message
+        appendMessage('assistant', lowPower ? 'Low Power enabled — context minimized.' : 'Low Power disabled — normal mode.');
       }
     });
 
-    // CoT toggle wiring
-    cotEnabled = loadCoT();
-    cotToggle.checked = cotEnabled;
-    if (lowPower && cotEnabled) { cotEnabled = false; cotToggle.checked = false; saveCoT(false); }
-    cotToggle.addEventListener('change', (e) => {
-      const requested = !!e.target.checked;
-      if (lowPower && requested) {
-        cotToggle.checked = false;
-        cotEnabled = false;
-        saveCoT(false);
-        appendMessage('assistant', 'Cannot enable detailed reasoning while Low Power is ON.');
-        return;
-      }
-      cotEnabled = requested;
-      saveCoT(cotEnabled);
-      appendMessage('assistant', cotEnabled ? 'Reasoning enabled (JSON output).' : 'Reasoning disabled.');
-    });
-
-    // Show reasoning inline toggle
-    showReasoningInline = loadShowReasoning();
-    showReasoningToggle.checked = showReasoningInline;
-    showReasoningToggle.addEventListener('change', (e) => {
-      showReasoningInline = !!e.target.checked;
-      saveShowReasoning(showReasoningInline);
-      appendMessage('assistant', showReasoningInline ? 'Reasoning will be shown inline.' : 'Reasoning will be hidden by default.');
-    });
-
-    // Traits editor wiring
-    function openTraits(){ renderTraitsModal(); traitsOverlay.style.display = 'flex'; traitsOverlay.setAttribute('aria-hidden','false'); }
+    // Traits editor
+    function openTraits(){
+      renderTraitsModal();
+      traitsOverlay.style.display = 'flex';
+      traitsOverlay.setAttribute('aria-hidden','false');
+    }
     function closeTraits(){ traitsOverlay.style.display = 'none'; traitsOverlay.setAttribute('aria-hidden','true'); }
 
     function renderTraitsModal(){
@@ -596,35 +410,32 @@
     }
 
     addTraitBtn.addEventListener('click', () => {
-      if (userTraits.length >= MAX_TRAITS) return;
+      if(userTraits.length >= MAX_TRAITS) return;
       userTraits.push('');
       renderTraitsModal();
     });
     saveTraitsBtn.addEventListener('click', () => {
+      // sanitize
       userTraits = userTraits.map(s => (s || '').trim()).filter(Boolean).slice(0, MAX_TRAITS);
       saveTraits(userTraits);
       closeTraits();
-      appendMessage('assistant', 'Traits saved.');
+      // feedback (no overlay if model already downloaded)
+      if (!modelDownloadedFlag()) {
+        showOverlay('Traits saved','They will be included on next boot if needed',0.3);
+        setTimeout(()=>hideOverlay(),600);
+      } else {
+        appendMessage('assistant', 'Traits saved.');
+      }
     });
     cancelTraitsBtn.addEventListener('click', () => closeTraits());
     traitsBtn.addEventListener('click', () => openTraits());
 
     // initial load
     userTraits = loadTraits();
-    if (!userTraits || !userTraits.length) {
-      userTraits = ['Concise','Numbered steps','English'];
+    if(!userTraits || !userTraits.length){
+      userTraits = ['Concise','Numbered steps','English']; // tiny defaults
       saveTraits(userTraits);
     }
-    lowPower = loadLowPower();
-    cotEnabled = loadCoT();
-    showReasoningInline = loadShowReasoning();
-    // ensure CoT disabled while in Low Power
-    if (lowPower && cotEnabled) { cotEnabled = false; cotToggle.checked = false; saveCoT(false); }
-
-    // sync toggles visually after load
-    lowPowerToggle.checked = lowPower;
-    cotToggle.checked = cotEnabled;
-    showReasoningToggle.checked = showReasoningInline;
 
     // focus input
     userInput.focus();
